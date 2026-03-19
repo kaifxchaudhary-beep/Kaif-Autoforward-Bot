@@ -8,6 +8,7 @@ const { Boom } = require('@hapi/boom');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const axios = require('axios');
 
 const { wasi_connectSession, wasi_clearSession } = require('./wasilib/session');
 const { wasi_connectDatabase } = require('./wasilib/database');
@@ -37,70 +38,48 @@ const QRCode = require('qrcode');
 // -----------------------------------------------------------------------------
 const sessions = new Map();
 
-// Track processed statuses with counters for multiple views
-const processedStatuses = new Map();
+// Track processed statuses
+const processedStatuses = new Set();
 
-// Authorized number for auto-forward commands
-const AUTHORIZED_NUMBER = '03039107958';
+// Store deleted messages
+const deletedMessagesCache = new Map();
 
-// Middleware
-wasi_app.use(express.json());
-wasi_app.use(express.static(path.join(__dirname, 'public')));
+// Track current emoji index for round-robin
+let currentEmojiIndex = 0;
 
-// Keep-Alive Route
-wasi_app.get('/ping', (req, res) => res.status(200).send('pong'));
-
-// -----------------------------------------------------------------------------
-// AUTO FORWARD CONFIGURATION
-// -----------------------------------------------------------------------------
-let SOURCE_JIDS = process.env.SOURCE_JIDS
-    ? process.env.SOURCE_JIDS.split(',').map(j => j.trim()).filter(j => j)
-    : [];
-
-let TARGET_JIDS = process.env.TARGET_JIDS
-    ? process.env.TARGET_JIDS.split(',').map(j => j.trim()).filter(j => j)
-    : [];
-
-if (botConfig.sourceJids && Array.isArray(botConfig.sourceJids)) {
-    SOURCE_JIDS = [...new Set([...SOURCE_JIDS, ...botConfig.sourceJids])];
-}
-if (botConfig.targetJids && Array.isArray(botConfig.targetJids)) {
-    TARGET_JIDS = [...new Set([...TARGET_JIDS, ...botConfig.targetJids])];
-}
-
-const OLD_TEXT_REGEX = process.env.OLD_TEXT_REGEX
-    ? process.env.OLD_TEXT_REGEX.split(',').map(pattern => {
-        try {
-            return pattern.trim() ? new RegExp(pattern.trim(), 'gu') : null;
-        } catch (e) {
-            console.error(`Invalid regex pattern: ${pattern}`, e);
-            return null;
-        }
-      }).filter(regex => regex !== null)
-    : [];
-
-const NEW_TEXT = process.env.NEW_TEXT || '';
+// Admin numbers (comma separated in env)
+const ADMIN_NUMBERS = process.env.ADMIN_NUMBERS ? 
+    process.env.ADMIN_NUMBERS.split(',').map(n => n.trim()) : ['03039107958'];
 
 // -----------------------------------------------------------------------------
-// AUTO STATUS CONFIGURATION - 100 VIEWS WITH CHANGING REACTIONS
+// CONFIGURATION VARIABLES
 // -----------------------------------------------------------------------------
+// Auto Status
 let AUTO_STATUS_VIEW = process.env.AUTO_STATUS_VIEW === 'true' || false;
 let AUTO_STATUS_REACT = process.env.AUTO_STATUS_REACT === 'true' || false;
-let AUTO_STATUS_REPLY = process.env.AUTO_STATUS_REPLY === 'true' || false;
-let STATUS_REACT_EMOJI = process.env.STATUS_REACT_EMOJI || '👍,❤️,😂,😍,👏,🔥,🎉,🥰,😎,💯';
-let STATUS_REPLY_TEXTS = process.env.STATUS_REPLY_TEXTS || 'Nice status!,Awesome!,Love it!,Great!,Beautiful!,Cool!,Amazing!';
-const MAX_REACTIONS_PER_STATUS = parseInt(process.env.MAX_REACTIONS_PER_STATUS) || 100;
-const MIN_REACTION_DELAY = parseInt(process.env.MIN_REACTION_DELAY) || 2000;
-const MAX_REACTION_DELAY = parseInt(process.env.MAX_REACTION_DELAY) || 5000;
+let STATUS_REACT_EMOJI = process.env.STATUS_REACT_EMOJI || '👍,❤️,😂,😍,👏,🔥';
 
+// Anti Delete
+let ANTI_DELETE_ENABLED = process.env.ANTI_DELETE_ENABLED === 'true' || false;
+let ANTI_DELETE_STATUS = process.env.ANTI_DELETE_STATUS === 'true' || false;
+
+// Anti Link
+let ANTI_LINK_ENABLED = process.env.ANTI_LINK_ENABLED === 'true' || false;
+let ANTI_LINK_ACTION = process.env.ANTI_LINK_ACTION || 'delete'; // delete, warn, kick
+let ALLOWED_LINKS = process.env.ALLOWED_LINKS ? 
+    process.env.ALLOWED_LINKS.split(',').map(l => l.trim()) : [];
+
+// Load from botConfig
 if (botConfig.autoStatusView !== undefined) AUTO_STATUS_VIEW = botConfig.autoStatusView;
 if (botConfig.autoStatusReact !== undefined) AUTO_STATUS_REACT = botConfig.autoStatusReact;
-if (botConfig.autoStatusReply !== undefined) AUTO_STATUS_REPLY = botConfig.autoStatusReply;
 if (botConfig.statusReactEmoji) STATUS_REACT_EMOJI = botConfig.statusReactEmoji;
-if (botConfig.statusReplyTexts) STATUS_REPLY_TEXTS = botConfig.statusReplyTexts;
+if (botConfig.antiDeleteEnabled !== undefined) ANTI_DELETE_ENABLED = botConfig.antiDeleteEnabled;
+if (botConfig.antiDeleteStatus !== undefined) ANTI_DELETE_STATUS = botConfig.antiDeleteStatus;
+if (botConfig.antiLinkEnabled !== undefined) ANTI_LINK_ENABLED = botConfig.antiLinkEnabled;
+if (botConfig.antiLinkAction) ANTI_LINK_ACTION = botConfig.antiLinkAction;
+if (botConfig.allowedLinks) ALLOWED_LINKS = botConfig.allowedLinks;
 
 let statusReactionEmojis = STATUS_REACT_EMOJI.split(',').map(e => e.trim());
-let statusReplyTextsArray = STATUS_REPLY_TEXTS.split(',').map(t => t.trim());
 
 // -----------------------------------------------------------------------------
 // CONFIG SAVE FUNCTION
@@ -108,13 +87,14 @@ let statusReplyTextsArray = STATUS_REPLY_TEXTS.split(',').map(t => t.trim());
 function saveBotConfig() {
     try {
         const configToSave = {
-            sourceJids: SOURCE_JIDS,
-            targetJids: TARGET_JIDS,
             autoStatusView: AUTO_STATUS_VIEW,
             autoStatusReact: AUTO_STATUS_REACT,
-            autoStatusReply: AUTO_STATUS_REPLY,
             statusReactEmoji: statusReactionEmojis.join(','),
-            statusReplyTexts: statusReplyTextsArray.join(','),
+            antiDeleteEnabled: ANTI_DELETE_ENABLED,
+            antiDeleteStatus: ANTI_DELETE_STATUS,
+            antiLinkEnabled: ANTI_LINK_ENABLED,
+            antiLinkAction: ANTI_LINK_ACTION,
+            allowedLinks: ALLOWED_LINKS,
             updatedAt: new Date().toISOString()
         };
         fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify(configToSave, null, 2));
@@ -126,148 +106,66 @@ function saveBotConfig() {
 }
 
 // -----------------------------------------------------------------------------
-// AUTHORIZATION CHECK
+// HELPER FUNCTIONS
 // -----------------------------------------------------------------------------
-function isAuthorizedForAutoForward(senderJid) {
-    const phoneNumber = senderJid.split('@')[0];
-    return phoneNumber === AUTHORIZED_NUMBER;
+function isAdmin(jid) {
+    const phoneNumber = jid.split('@')[0];
+    return ADMIN_NUMBERS.includes(phoneNumber);
 }
 
-function getUnauthorizedMessage() {
-    return "❌ *Unauthorized Access*\n\nOnly the authorized admin (03039107958) can use auto-forward commands.\nPlease contact admin to request access.";
+function isGroup(jid) {
+    return jid.endsWith('@g.us');
 }
 
-// -----------------------------------------------------------------------------
-// MESSAGE CLEANING FUNCTIONS
-// -----------------------------------------------------------------------------
-function cleanForwardedLabel(message) {
-    try {
-        let cleanedMessage = JSON.parse(JSON.stringify(message));
-        
-        const messageTypes = ['extendedTextMessage', 'imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'];
-        
-        messageTypes.forEach(type => {
-            if (cleanedMessage[type]?.contextInfo) {
-                cleanedMessage[type].contextInfo.isForwarded = false;
-                if (cleanedMessage[type].contextInfo.forwardingScore) {
-                    cleanedMessage[type].contextInfo.forwardingScore = 0;
-                }
-            }
-        });
-        
-        return cleanedMessage;
-    } catch (error) {
-        return message;
-    }
+function extractLinks(text) {
+    if (!text) return [];
+    const urlRegex = /(https?:\/\/[^\s]+)|(www\.[^\s]+)|([a-zA-Z0-9-]+\.(com|org|net|gov|edu|pk|in|uk|au|ca|de|fr|jp|cn|br|ru|app|io|xyz|tech|online|site|club|pk)[^\s]*)/gi;
+    return text.match(urlRegex) || [];
 }
 
-function cleanNewsletterText(text) {
-    if (!text) return text;
-    
-    const newsletterMarkers = [
-        /📢\s*/g, /🔔\s*/g, /📰\s*/g, /🗞️\s*/g,
-        /\[NEWSLETTER\]/gi, /\[BROADCAST\]/gi, /\[ANNOUNCEMENT\]/gi,
-        /Newsletter:/gi, /Broadcast:/gi, /Announcement:/gi,
-        /Forwarded many times/gi, /Forwarded message/gi,
-        /This is a broadcast message/gi
-    ];
-    
-    let cleanedText = text;
-    newsletterMarkers.forEach(marker => {
-        cleanedText = cleanedText.replace(marker, '');
-    });
-    
-    return cleanedText.trim();
-}
-
-function replaceCaption(caption) {
-    if (!caption || !OLD_TEXT_REGEX.length || !NEW_TEXT) return caption;
-    
-    let result = caption;
-    OLD_TEXT_REGEX.forEach(regex => {
-        result = result.replace(regex, NEW_TEXT);
-    });
-    return result;
-}
-
-function processAndCleanMessage(originalMessage) {
-    try {
-        let cleanedMessage = JSON.parse(JSON.stringify(originalMessage));
-        cleanedMessage = cleanForwardedLabel(cleanedMessage);
-        
-        const text = cleanedMessage.conversation ||
-            cleanedMessage.extendedTextMessage?.text ||
-            cleanedMessage.imageMessage?.caption ||
-            cleanedMessage.videoMessage?.caption ||
-            cleanedMessage.documentMessage?.caption || '';
-        
-        if (text) {
-            const cleanedText = cleanNewsletterText(text);
-            
-            if (cleanedMessage.conversation) {
-                cleanedMessage.conversation = cleanedText;
-            } else if (cleanedMessage.extendedTextMessage?.text) {
-                cleanedMessage.extendedTextMessage.text = cleanedText;
-            } else if (cleanedMessage.imageMessage?.caption) {
-                cleanedMessage.imageMessage.caption = replaceCaption(cleanedText);
-            } else if (cleanedMessage.videoMessage?.caption) {
-                cleanedMessage.videoMessage.caption = replaceCaption(cleanedText);
-            } else if (cleanedMessage.documentMessage?.caption) {
-                cleanedMessage.documentMessage.caption = replaceCaption(cleanedText);
-            }
-        }
-        
-        delete cleanedMessage.protocolMessage;
-        return cleanedMessage;
-    } catch (error) {
-        return originalMessage;
-    }
+function isLinkAllowed(link) {
+    if (ALLOWED_LINKS.length === 0) return false;
+    return ALLOWED_LINKS.some(allowed => link.includes(allowed));
 }
 
 // -----------------------------------------------------------------------------
-// STATUS HANDLER - 100 VIEWS WITH CHANGING REACTIONS
+// STATUS HANDLER
 // -----------------------------------------------------------------------------
 async function handleStatus(sock, statusMessage) {
     try {
-        if (!AUTO_STATUS_VIEW && !AUTO_STATUS_REACT && !AUTO_STATUS_REPLY) return;
+        if (!AUTO_STATUS_VIEW && !AUTO_STATUS_REACT) return;
         
         const statusKey = statusMessage.key;
         const statusId = statusKey.id;
         const statusSender = statusKey.participant || statusKey.remoteJid;
         
-        let currentCount = processedStatuses.get(statusId) || 0;
-        
-        if (currentCount === 0) {
-            console.log(`📱 New status from: ${statusSender}`);
-            console.log(`🎯 Will generate ${MAX_REACTIONS_PER_STATUS} views with changing reactions`);
+        if (processedStatuses.has(statusId)) {
+            return;
         }
         
-        currentCount++;
-        processedStatuses.set(statusId, currentCount);
+        processedStatuses.add(statusId);
+        console.log(`📱 New status from: ${statusSender}`);
         
-        // Limit map size
-        if (processedStatuses.size > 100) {
-            const oldestKey = processedStatuses.keys().next().value;
-            processedStatuses.delete(oldestKey);
+        if (processedStatuses.size > 1000) {
+            const iterator = processedStatuses.values();
+            for (let i = 0; i < 500; i++) {
+                processedStatuses.delete(iterator.next().value);
+            }
         }
         
-        console.log(`🔄 Status ${statusId} - Attempt #${currentCount}/${MAX_REACTIONS_PER_STATUS}`);
-        
-        // ✅ View status - یہ ویو بڑھائے گا (ہر بار)
         if (AUTO_STATUS_VIEW) {
             try {
                 await sock.readMessages([statusKey]);
-                console.log(`👁️ View #${currentCount} for status from: ${statusSender} (Total views: ${currentCount})`);
+                console.log(`👁️ Viewed status from: ${statusSender}`);
             } catch (error) {
                 console.error('Error viewing status:', error);
             }
         }
         
-        // ✅ React with different emoji - ہر بار نیا ری ایکشن (پرانا ہٹ جائے گا)
         if (AUTO_STATUS_REACT && statusReactionEmojis.length > 0) {
             try {
-                const emojiIndex = (currentCount - 1) % statusReactionEmojis.length;
-                const selectedEmoji = statusReactionEmojis[emojiIndex];
+                const selectedEmoji = statusReactionEmojis[currentEmojiIndex];
+                currentEmojiIndex = (currentEmojiIndex + 1) % statusReactionEmojis.length;
                 
                 await sock.sendMessage(statusSender, {
                     react: {
@@ -275,46 +173,10 @@ async function handleStatus(sock, statusMessage) {
                         key: statusKey
                     }
                 });
-                console.log(`❤️ Reaction #${currentCount}: ${selectedEmoji}`);
+                console.log(`❤️ Reacted to status with ${selectedEmoji}`);
             } catch (error) {
                 console.error('Error reacting:', error);
             }
-        }
-        
-        // ✅ Reply with different text - ہر بار نیا ریپلائی
-        if (AUTO_STATUS_REPLY && statusReplyTextsArray.length > 0) {
-            try {
-                const replyIndex = (currentCount - 1) % statusReplyTextsArray.length;
-                const selectedReply = statusReplyTextsArray[replyIndex];
-                
-                await sock.sendMessage(statusSender, {
-                    text: selectedReply,
-                    contextInfo: {
-                        stanzaId: statusKey.id,
-                        participant: statusSender,
-                        quotedMessage: statusMessage.message
-                    }
-                });
-                console.log(`💬 Reply #${currentCount}: "${selectedReply}"`);
-            } catch (error) {
-                console.error('Error replying:', error);
-            }
-        }
-        
-        // ✅ Schedule next view/reaction
-        if (currentCount < MAX_REACTIONS_PER_STATUS) {
-            // Random delay between MIN and MAX
-            const nextDelay = Math.floor(Math.random() * (MAX_REACTION_DELAY - MIN_REACTION_DELAY)) + MIN_REACTION_DELAY;
-            
-            console.log(`⏰ Next view/reaction in ${nextDelay/1000} seconds (View #${currentCount + 1})`);
-            
-            setTimeout(() => {
-                handleStatus(sock, statusMessage);
-            }, nextDelay);
-        } else {
-            console.log(`✅ Completed ${MAX_REACTIONS_PER_STATUS} views for status from: ${statusSender}`);
-            console.log(`📊 Total views generated: ${MAX_REACTIONS_PER_STATUS}`);
-            processedStatuses.delete(statusId);
         }
         
     } catch (error) {
@@ -323,450 +185,541 @@ async function handleStatus(sock, statusMessage) {
 }
 
 // -----------------------------------------------------------------------------
+// ANTI DELETE HANDLER
+// -----------------------------------------------------------------------------
+async function handleAntiDelete(sock, msg) {
+    try {
+        if (!ANTI_DELETE_ENABLED) return;
+        
+        const from = msg.key.remoteJid;
+        
+        // Check for deleted messages in groups
+        if (msg.message?.protocolMessage?.type === 0) { // Revoke/Delete message
+            const protocolMsg = msg.message.protocolMessage;
+            const deletedMsgId = protocolMsg.key.id;
+            const deletedMsgFrom = protocolMsg.key.remoteJid;
+            
+            // Check if we have this message cached
+            if (deletedMessagesCache.has(deletedMsgId)) {
+                const cachedMsg = deletedMessagesCache.get(deletedMsgId);
+                
+                const deletedBy = msg.key.participant || msg.key.remoteJid;
+                const deletedByName = msg.pushName || 'Unknown';
+                
+                let caption = `🚫 *MESSAGE DELETED*\n\n`;
+                caption += `• Deleted by: ${deletedByName} (${deletedBy.split('@')[0]})\n`;
+                caption += `• Chat: ${deletedMsgFrom}\n`;
+                caption += `• Time: ${new Date().toLocaleString()}\n\n`;
+                
+                if (cachedMsg.text) {
+                    caption += `*Message Content:*\n${cachedMsg.text}`;
+                    await sock.sendMessage(deletedMsgFrom, { text: caption });
+                } else if (cachedMsg.media) {
+                    caption += `*Media Type:* ${cachedMsg.mediaType}`;
+                    await sock.sendMessage(deletedMsgFrom, { text: caption });
+                    
+                    // Try to resend media if available
+                    if (cachedMsg.mediaData) {
+                        await sock.sendMessage(deletedMsgFrom, cachedMsg.mediaData);
+                    }
+                }
+                
+                console.log(`🚫 Captured deleted message from ${deletedBy}`);
+                deletedMessagesCache.delete(deletedMsgId);
+            }
+        }
+        
+        // Check for deleted statuses
+        if (ANTI_DELETE_STATUS && from === 'status@broadcast' && msg.message?.protocolMessage?.type === 0) {
+            console.log(`🚫 Status deleted by ${msg.key.participant || 'Unknown'}`);
+        }
+        
+    } catch (error) {
+        console.error('Error in anti-delete handler:', error);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ANTI LINK HANDLER
+// -----------------------------------------------------------------------------
+async function handleAntiLink(sock, msg) {
+    try {
+        if (!ANTI_LINK_ENABLED) return;
+        
+        const from = msg.key.remoteJid;
+        if (!isGroup(from)) return;
+        
+        const sender = msg.key.participant || msg.key.remoteJid;
+        if (isAdmin(sender)) return; // Skip admins
+        
+        const text = msg.message.conversation ||
+            msg.message.extendedTextMessage?.text ||
+            msg.message.imageMessage?.caption ||
+            msg.message.videoMessage?.caption ||
+            "";
+        
+        const links = extractLinks(text);
+        if (links.length === 0) return;
+        
+        // Check if any link is not allowed
+        const hasDisallowedLink = links.some(link => !isLinkAllowed(link));
+        
+        if (hasDisallowedLink) {
+            console.log(`🔗 Link detected in ${from} from ${sender}: ${links.join(', ')}`);
+            
+            // Delete the message
+            if (ANTI_LINK_ACTION === 'delete' || ANTI_LINK_ACTION === 'warn') {
+                try {
+                    await sock.sendMessage(from, { delete: msg.key });
+                    console.log(`🗑️ Deleted link message from ${sender}`);
+                } catch (error) {
+                    console.error('Error deleting message:', error);
+                }
+            }
+            
+            // Send warning
+            if (ANTI_LINK_ACTION === 'warn' || ANTI_LINK_ACTION === 'kick') {
+                const warnMsg = `⚠️ *Anti-Link System*\n\n@${sender.split('@')[0]}, links are not allowed in this group.`;
+                await sock.sendMessage(from, { 
+                    text: warnMsg,
+                    mentions: [sender]
+                });
+            }
+            
+            // Kick member
+            if (ANTI_LINK_ACTION === 'kick') {
+                try {
+                    await sock.groupParticipantsUpdate(from, [sender], 'remove');
+                    console.log(`👢 Kicked ${sender} for sending link`);
+                } catch (error) {
+                    console.error('Error kicking member:', error);
+                }
+            }
+        }
+        
+    } catch (error) {
+        console.error('Error in anti-link handler:', error);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// CACHE MESSAGES FOR ANTI-DELETE
+// -----------------------------------------------------------------------------
+function cacheMessage(msg) {
+    try {
+        if (!ANTI_DELETE_ENABLED) return;
+        
+        const msgId = msg.key.id;
+        const msgText = msg.message.conversation ||
+            msg.message.extendedTextMessage?.text ||
+            msg.message.imageMessage?.caption ||
+            msg.message.videoMessage?.caption ||
+            "";
+        
+        let mediaType = null;
+        let mediaData = null;
+        
+        if (msg.message.imageMessage) {
+            mediaType = 'Image';
+            mediaData = {
+                image: msg.message.imageMessage,
+                caption: msg.message.imageMessage.caption
+            };
+        } else if (msg.message.videoMessage) {
+            mediaType = 'Video';
+            mediaData = {
+                video: msg.message.videoMessage,
+                caption: msg.message.videoMessage.caption
+            };
+        } else if (msg.message.audioMessage) {
+            mediaType = 'Audio';
+        } else if (msg.message.documentMessage) {
+            mediaType = 'Document';
+        } else if (msg.message.stickerMessage) {
+            mediaType = 'Sticker';
+        }
+        
+        deletedMessagesCache.set(msgId, {
+            text: msgText,
+            media: !!mediaType,
+            mediaType: mediaType,
+            mediaData: mediaData,
+            timestamp: Date.now()
+        });
+        
+        // Limit cache size
+        if (deletedMessagesCache.size > 500) {
+            const oldestKey = deletedMessagesCache.keys().next().value;
+            deletedMessagesCache.delete(oldestKey);
+        }
+        
+    } catch (error) {
+        console.error('Error caching message:', error);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // COMMAND HANDLERS
 // -----------------------------------------------------------------------------
-async function handleMenuCommand(sock, from, senderJid) {
-    const isAuthorized = isAuthorizedForAutoForward(senderJid);
-    
+async function handleMenuCommand(sock, from) {
     let menuText = `╔════════════════════╗
 ║   *MUZAMMIL MD BOT*   ║
 ╚════════════════════╝
 
-*Bot Name:* Muzammil MD
-*Developer:* Muzammil
-*Version:* 4.0.0
+*Bot:* Muzammil MD
+*Version:* 3.0.0
 
 ╔════════════════════╗
 ║   *BASIC COMMANDS*   ║
 ╚════════════════════╝
 
 • !ping - Check bot response
-• !jid - Get current chat JID
-• !gjid - List all groups
 • !menu - Show this menu
-• !help - Detailed help
+• !help - Show help
 
 ╔════════════════════╗
 ║   *STATUS COMMANDS*   ║
 ╚════════════════════╝
 
-• !statusreact - Reaction settings
-• !statusreply - Reply settings
+• !status - Show settings
+• !statusview on/off - Toggle auto view
+• !statusreact on/off - Toggle auto react
+• !setemojis 👍,❤️,😂 - Set reaction emojis
 
 ╔════════════════════╗
-║ *AUTO-FORWARD COMMANDS* ║
+║  *ANTI-DELETE COMMANDS*  ║
 ╚════════════════════╝
 
-*Restricted to: 03039107958*
+• !antidelete on/off - Toggle anti-delete
+• !antistatus on/off - Toggle status delete capture
+• !deletedcache - Show cache size
 
-• !addsource <JID> - Add source
-• !addtarget <JID> - Add target
-• !removesource <JID/num> - Remove source
-• !removetarget <JID/num> - Remove target
-• !listsources - List sources
-• !listtargets - List targets
+╔════════════════════╗
+║   *ANTI-LINK COMMANDS*   ║
+╚════════════════════╝
+
+• !antilink on/off - Toggle anti-link
+• !antilink action delete/warn/kick - Set action
+• !allowlink domain.com - Add allowed domain
+• !removelink domain.com - Remove allowed domain
+• !listlinks - List allowed domains
 
 ╔════════════════════╗
 ║   *CURRENT STATUS*   ║
 ╚════════════════════╝
 
-• Auto View: ${AUTO_STATUS_VIEW ? '✅' : '❌'}
-• Auto React: ${AUTO_STATUS_REACT ? '✅' : '❌'}
-• Auto Reply: ${AUTO_STATUS_REPLY ? '✅' : '❌'}
-• Max Views: ${MAX_REACTIONS_PER_STATUS}
-• Sources: ${SOURCE_JIDS.length}
-• Targets: ${TARGET_JIDS.length}
+• Status View: ${AUTO_STATUS_VIEW ? '✅' : '❌'}
+• Status React: ${AUTO_STATUS_REACT ? '✅' : '❌'}
+• Anti-Delete: ${ANTI_DELETE_ENABLED ? '✅' : '❌'}
+• Anti-Status: ${ANTI_DELETE_STATUS ? '✅' : '❌'}
+• Anti-Link: ${ANTI_LINK_ENABLED ? '✅' : '❌'}
+• Action: ${ANTI_LINK_ACTION}
 
-_Muzammil MD Bot v4.0_`;
+_Muzammil MD Bot_`;
 
     await sock.sendMessage(from, { text: menuText });
 }
 
-async function handleHelpCommand(sock, from, senderJid, command) {
-    if (command) {
-        const cmd = command.toLowerCase();
-        let helpText = '';
-        
-        const helpMap = {
-            'ping': '*!ping*\nCheck if bot is alive\nResponse: Love You😘\nAccess: Everyone',
-            'jid': '*!jid*\nGet current chat JID\nAccess: Everyone',
-            'gjid': '*!gjid*\nList all groups with details\nAccess: Everyone',
-            'menu': '*!menu*\nShow main menu\nAccess: Everyone',
-            'statusreact': '*!statusreact*\nManage reaction settings\n• !statusreact - View\n• !statusreact on/off\n• !statusreact 👍,❤️ - Set emojis\nAccess: Everyone',
-            'statusreply': '*!statusreply*\nManage reply settings\n• !statusreply - View\n• !statusreply on/off\n• !statusreply text1,text2 - Set replies\nAccess: Everyone',
-            'addsource': '*!addsource*\nAdd source group\nExample: !addsource 123@g.us\nAccess: Admin Only',
-            'addtarget': '*!addtarget*\nAdd target group\nExample: !addtarget 456@g.us\nAccess: Admin Only',
-            'removesource': '*!removesource*\nRemove source\n!removesource <JID/num>\nAccess: Admin Only',
-            'removetarget': '*!removetarget*\nRemove target\n!removetarget <JID/num>\nAccess: Admin Only',
-            'listsources': '*!listsources*\nList all sources\nAccess: Admin Only',
-            'listtargets': '*!listtargets*\nList all targets\nAccess: Admin Only'
-        };
-        
-        helpText = helpMap[cmd] || `❌ Command '${command}' not found. Use !help`;
-        await sock.sendMessage(from, { text: helpText });
-    } else {
-        let helpSummary = `╔════════════════════╗
+async function handleHelpCommand(sock, from) {
+    let helpText = `╔════════════════════╗
 ║   *MUZAMMIL MD HELP*   ║
 ╚════════════════════╝
 
-*BASIC (Everyone)*
-!ping !jid !gjid !menu
+*BASIC COMMANDS*
+!ping - Check bot
+!menu - Main menu
+!help - This help
 
-*STATUS (Everyone)*
-!statusreact !statusreply
+*STATUS FEATURES*
+!statusview on/off - Auto view status
+!statusreact on/off - Auto react to status
+!setemojis 👍,❤️,😂 - Set reaction emojis
 
-*ADMIN ONLY (03039107958)*
-!addsource !addtarget
-!removesource !removetarget
-!listsources !listtargets
+*ANTI-DELETE FEATURES*
+Captures deleted messages and shows who deleted
+!antidelete on/off - Enable/disable
+!antistatus on/off - Capture deleted statuses
 
-*Details: !help <command>*
+*ANTI-LINK FEATURES*
+Blocks links in groups
+!antilink on/off - Enable/disable
+!antilink action delete/warn/kick - Set action
+!allowlink domain.com - Add allowed domain
+!removelink domain.com - Remove domain
+!listlinks - Show allowed domains
 
-_Muzammil MD Bot v4.0_`;
+*Note: Some commands are admin only*`;
 
-        await sock.sendMessage(from, { text: helpSummary });
-    }
+    await sock.sendMessage(from, { text: helpText });
 }
 
 async function handlePingCommand(sock, from) {
     await sock.sendMessage(from, { text: "Love You😘" });
 }
 
-async function handleJidCommand(sock, from) {
-    await sock.sendMessage(from, { text: `${from}` });
+// Status Commands
+async function handleStatusCommand(sock, from) {
+    let statusText = `*Current Status Settings*
+
+Auto View: ${AUTO_STATUS_VIEW ? '✅ ON' : '❌ OFF'}
+Auto React: ${AUTO_STATUS_REACT ? '✅ ON' : '❌ OFF'}
+
+Reaction Emojis:
+${statusReactionEmojis.map((e, i) => `${i+1}. ${e}`).join('\n')}
+
+Next Emoji: ${statusReactionEmojis[currentEmojiIndex]}
+
+Processed Statuses: ${processedStatuses.size}`;
+
+    await sock.sendMessage(from, { text: statusText });
 }
 
-async function handleGjidCommand(sock, from) {
-    try {
-        const groups = await sock.groupFetchAllParticipating();
-        
-        let response = "📌 *Groups List:*\n\n";
-        let groupCount = 1;
-        
-        for (const [jid, group] of Object.entries(groups)) {
-            response += `${groupCount}. *${group.subject || 'Unnamed'}*\n`;
-            response += `   👥 ${group.participants?.length || 0} members\n`;
-            response += `   🆔: \`${jid}\`\n`;
-            response += `   ──────────────\n\n`;
-            groupCount++;
-        }
-        
-        response += groupCount === 1 ? "❌ No groups found." : `\n*Total: ${groupCount - 1}*`;
-        await sock.sendMessage(from, { text: response });
-    } catch (error) {
-        await sock.sendMessage(from, { text: "❌ Error fetching groups" });
+async function handleStatusViewCommand(sock, from, args, sender) {
+    if (!isAdmin(sender)) {
+        await sock.sendMessage(from, { text: "❌ Admin only command!" });
+        return;
+    }
+    
+    if (!args || args.length === 0) {
+        await sock.sendMessage(from, { text: `Auto Status View is currently ${AUTO_STATUS_VIEW ? '✅ ON' : '❌ OFF'}\n\nUse: !statusview on/off` });
+        return;
+    }
+    
+    const option = args[0].toLowerCase();
+    
+    if (option === 'on') {
+        AUTO_STATUS_VIEW = true;
+        saveBotConfig();
+        await sock.sendMessage(from, { text: "✅ Auto Status View is now *ON*" });
+    } else if (option === 'off') {
+        AUTO_STATUS_VIEW = false;
+        saveBotConfig();
+        await sock.sendMessage(from, { text: "❌ Auto Status View is now *OFF*" });
+    } else {
+        await sock.sendMessage(from, { text: "Usage: !statusview on/off" });
     }
 }
 
-async function handleStatusReactCommand(sock, from, args, senderJid) {
-    try {
-        if (!args || args.length === 0) {
-            await sock.sendMessage(from, { 
-                text: `*Status React Settings*\n\n` +
-                      `Status: ${AUTO_STATUS_REACT ? '✅ ON' : '❌ OFF'}\n` +
-                      `Emojis: ${statusReactionEmojis.join(', ')}\n\n` +
-                      `Commands:\n` +
-                      `!statusreact on\n` +
-                      `!statusreact off\n` +
-                      `!statusreact 👍,❤️,😂`
-            });
-            return;
-        }
-        
-        const firstArg = args[0].toLowerCase();
-        
-        if (firstArg === 'on') {
-            AUTO_STATUS_REACT = true;
-            saveBotConfig();
-            await sock.sendMessage(from, { text: "✅ Auto Status React is now *ON*" });
-            return;
-        }
-        
-        if (firstArg === 'off') {
-            AUTO_STATUS_REACT = false;
-            saveBotConfig();
-            await sock.sendMessage(from, { text: "❌ Auto Status React is now *OFF*" });
-            return;
-        }
-        
-        const emojiString = args.join(' ');
-        const newEmojis = emojiString.split(',').map(e => e.trim());
-        
-        if (newEmojis.length === 0) {
-            await sock.sendMessage(from, { text: "❌ No emojis provided!" });
-            return;
-        }
-        
-        statusReactionEmojis = newEmojis;
+async function handleStatusReactCommand(sock, from, args, sender) {
+    if (!isAdmin(sender)) {
+        await sock.sendMessage(from, { text: "❌ Admin only command!" });
+        return;
+    }
+    
+    if (!args || args.length === 0) {
+        await sock.sendMessage(from, { text: `Auto Status React is currently ${AUTO_STATUS_REACT ? '✅ ON' : '❌ OFF'}\n\nUse: !statusreact on/off` });
+        return;
+    }
+    
+    const option = args[0].toLowerCase();
+    
+    if (option === 'on') {
+        AUTO_STATUS_REACT = true;
         saveBotConfig();
-        
+        await sock.sendMessage(from, { text: "✅ Auto Status React is now *ON*" });
+    } else if (option === 'off') {
+        AUTO_STATUS_REACT = false;
+        saveBotConfig();
+        await sock.sendMessage(from, { text: "❌ Auto Status React is now *OFF*" });
+    } else {
+        await sock.sendMessage(from, { text: "Usage: !statusreact on/off" });
+    }
+}
+
+async function handleSetEmojisCommand(sock, from, args, sender) {
+    if (!isAdmin(sender)) {
+        await sock.sendMessage(from, { text: "❌ Admin only command!" });
+        return;
+    }
+    
+    if (!args || args.length === 0) {
         await sock.sendMessage(from, { 
-            text: `✅ Status reaction emojis updated to: ${newEmojis.join(', ')}` 
+            text: `Current emojis: ${statusReactionEmojis.join(' ')}\n\nUsage: !setemojis 👍,❤️,😂` 
         });
-        
-    } catch (error) {
-        await sock.sendMessage(from, { text: "❌ Error updating status reaction" });
+        return;
+    }
+    
+    const emojiString = args.join(' ');
+    const newEmojis = emojiString.split(',').map(e => e.trim());
+    
+    if (newEmojis.length === 0) {
+        await sock.sendMessage(from, { text: "❌ No emojis provided!" });
+        return;
+    }
+    
+    statusReactionEmojis = newEmojis;
+    currentEmojiIndex = 0;
+    saveBotConfig();
+    
+    await sock.sendMessage(from, { 
+        text: `✅ Reaction emojis updated to: ${newEmojis.join(' ')}` 
+    });
+}
+
+// Anti-Delete Commands
+async function handleAntiDeleteCommand(sock, from, args, sender) {
+    if (!isAdmin(sender)) {
+        await sock.sendMessage(from, { text: "❌ Admin only command!" });
+        return;
+    }
+    
+    if (!args || args.length === 0) {
+        await sock.sendMessage(from, { text: `Anti-Delete is currently ${ANTI_DELETE_ENABLED ? '✅ ON' : '❌ OFF'}\n\nUse: !antidelete on/off` });
+        return;
+    }
+    
+    const option = args[0].toLowerCase();
+    
+    if (option === 'on') {
+        ANTI_DELETE_ENABLED = true;
+        saveBotConfig();
+        await sock.sendMessage(from, { text: "✅ Anti-Delete is now *ON*" });
+    } else if (option === 'off') {
+        ANTI_DELETE_ENABLED = false;
+        saveBotConfig();
+        await sock.sendMessage(from, { text: "❌ Anti-Delete is now *OFF*" });
+    } else {
+        await sock.sendMessage(from, { text: "Usage: !antidelete on/off" });
     }
 }
 
-async function handleStatusReplyCommand(sock, from, args, senderJid) {
-    try {
-        if (!args || args.length === 0) {
-            await sock.sendMessage(from, { 
-                text: `*Status Reply Settings*\n\n` +
-                      `Status: ${AUTO_STATUS_REPLY ? '✅ ON' : '❌ OFF'}\n` +
-                      `Replies: ${statusReplyTextsArray.join(', ')}\n\n` +
-                      `Commands:\n` +
-                      `!statusreply on\n` +
-                      `!statusreply off\n` +
-                      `!statusreply text1,text2,text3`
-            });
-            return;
-        }
-        
-        const firstArg = args[0].toLowerCase();
-        
-        if (firstArg === 'on') {
-            AUTO_STATUS_REPLY = true;
+async function handleAntiStatusCommand(sock, from, args, sender) {
+    if (!isAdmin(sender)) {
+        await sock.sendMessage(from, { text: "❌ Admin only command!" });
+        return;
+    }
+    
+    if (!args || args.length === 0) {
+        await sock.sendMessage(from, { text: `Anti-Delete Status is currently ${ANTI_DELETE_STATUS ? '✅ ON' : '❌ OFF'}\n\nUse: !antistatus on/off` });
+        return;
+    }
+    
+    const option = args[0].toLowerCase();
+    
+    if (option === 'on') {
+        ANTI_DELETE_STATUS = true;
+        saveBotConfig();
+        await sock.sendMessage(from, { text: "✅ Anti-Delete Status is now *ON*" });
+    } else if (option === 'off') {
+        ANTI_DELETE_STATUS = false;
+        saveBotConfig();
+        await sock.sendMessage(from, { text: "❌ Anti-Delete Status is now *OFF*" });
+    } else {
+        await sock.sendMessage(from, { text: "Usage: !antistatus on/off" });
+    }
+}
+
+async function handleDeletedCacheCommand(sock, from, sender) {
+    if (!isAdmin(sender)) {
+        await sock.sendMessage(from, { text: "❌ Admin only command!" });
+        return;
+    }
+    
+    await sock.sendMessage(from, { 
+        text: `📦 Deleted Messages Cache: ${deletedMessagesCache.size} messages` 
+    });
+}
+
+// Anti-Link Commands
+async function handleAntiLinkCommand(sock, from, args, sender) {
+    if (!isAdmin(sender)) {
+        await sock.sendMessage(from, { text: "❌ Admin only command!" });
+        return;
+    }
+    
+    if (!args || args.length === 0) {
+        await sock.sendMessage(from, { text: `Anti-Link is currently ${ANTI_LINK_ENABLED ? '✅ ON' : '❌ OFF'}\nAction: ${ANTI_LINK_ACTION}\n\nUse: !antilink on/off` });
+        return;
+    }
+    
+    const option = args[0].toLowerCase();
+    
+    if (option === 'on') {
+        ANTI_LINK_ENABLED = true;
+        saveBotConfig();
+        await sock.sendMessage(from, { text: "✅ Anti-Link is now *ON*" });
+    } else if (option === 'off') {
+        ANTI_LINK_ENABLED = false;
+        saveBotConfig();
+        await sock.sendMessage(from, { text: "❌ Anti-Link is now *OFF*" });
+    } else if (option === 'action' && args[1]) {
+        const action = args[1].toLowerCase();
+        if (['delete', 'warn', 'kick'].includes(action)) {
+            ANTI_LINK_ACTION = action;
             saveBotConfig();
-            await sock.sendMessage(from, { text: "✅ Auto Status Reply is now *ON*" });
-            return;
+            await sock.sendMessage(from, { text: `✅ Anti-Link action set to: *${action}*` });
+        } else {
+            await sock.sendMessage(from, { text: "❌ Invalid action! Use: delete/warn/kick" });
         }
-        
-        if (firstArg === 'off') {
-            AUTO_STATUS_REPLY = false;
-            saveBotConfig();
-            await sock.sendMessage(from, { text: "❌ Auto Status Reply is now *OFF*" });
-            return;
-        }
-        
-        const replyString = args.join(' ');
-        const newReplies = replyString.split(',').map(t => t.trim());
-        
-        if (newReplies.length === 0) {
-            await sock.sendMessage(from, { text: "❌ No reply texts provided!" });
-            return;
-        }
-        
-        statusReplyTextsArray = newReplies;
-        saveBotConfig();
-        
-        await sock.sendMessage(from, { 
-            text: `✅ Status reply texts updated to: ${newReplies.join(', ')}` 
-        });
-        
-    } catch (error) {
-        await sock.sendMessage(from, { text: "❌ Error updating status reply" });
+    } else {
+        await sock.sendMessage(from, { text: "Usage: !antilink on/off\n!antilink action delete/warn/kick" });
     }
 }
 
-// Auto-Forward Command Handlers (Authorized Only)
-async function handleAddSourceCommand(sock, from, args, senderJid) {
-    if (!isAuthorizedForAutoForward(senderJid)) {
-        await sock.sendMessage(from, { text: getUnauthorizedMessage() });
+async function handleAllowLinkCommand(sock, from, args, sender) {
+    if (!isAdmin(sender)) {
+        await sock.sendMessage(from, { text: "❌ Admin only command!" });
         return;
     }
     
-    try {
-        if (!args || args.length === 0) {
-            await sock.sendMessage(from, { 
-                text: `Current sources:\n${SOURCE_JIDS.map(j => `• ${j}`).join('\n') || 'None'}\n\nUsage: !addsource <JID>`
-            });
-            return;
-        }
-        
-        const newJid = args[0].trim();
-        
-        if (!newJid.includes('@')) {
-            await sock.sendMessage(from, { text: "❌ Invalid JID format!" });
-            return;
-        }
-        
-        if (SOURCE_JIDS.includes(newJid)) {
-            await sock.sendMessage(from, { text: "❌ JID already exists!" });
-            return;
-        }
-        
-        SOURCE_JIDS.push(newJid);
-        saveBotConfig();
-        
-        await sock.sendMessage(from, { 
-            text: `✅ Added source: ${newJid}\nTotal: ${SOURCE_JIDS.length}` 
-        });
-        
-    } catch (error) {
-        await sock.sendMessage(from, { text: "❌ Error adding source" });
+    if (!args || args.length === 0) {
+        await sock.sendMessage(from, { text: `Usage: !allowlink domain.com` });
+        return;
     }
+    
+    const domain = args[0].toLowerCase();
+    
+    if (ALLOWED_LINKS.includes(domain)) {
+        await sock.sendMessage(from, { text: `❌ ${domain} is already allowed` });
+        return;
+    }
+    
+    ALLOWED_LINKS.push(domain);
+    saveBotConfig();
+    await sock.sendMessage(from, { text: `✅ Added ${domain} to allowed links` });
 }
 
-async function handleAddTargetCommand(sock, from, args, senderJid) {
-    if (!isAuthorizedForAutoForward(senderJid)) {
-        await sock.sendMessage(from, { text: getUnauthorizedMessage() });
+async function handleRemoveLinkCommand(sock, from, args, sender) {
+    if (!isAdmin(sender)) {
+        await sock.sendMessage(from, { text: "❌ Admin only command!" });
         return;
     }
     
-    try {
-        if (!args || args.length === 0) {
-            await sock.sendMessage(from, { 
-                text: `Current targets:\n${TARGET_JIDS.map(j => `• ${j}`).join('\n') || 'None'}\n\nUsage: !addtarget <JID>`
-            });
-            return;
-        }
-        
-        const newJid = args[0].trim();
-        
-        if (!newJid.includes('@')) {
-            await sock.sendMessage(from, { text: "❌ Invalid JID format!" });
-            return;
-        }
-        
-        if (TARGET_JIDS.includes(newJid)) {
-            await sock.sendMessage(from, { text: "❌ JID already exists!" });
-            return;
-        }
-        
-        TARGET_JIDS.push(newJid);
-        saveBotConfig();
-        
-        await sock.sendMessage(from, { 
-            text: `✅ Added target: ${newJid}\nTotal: ${TARGET_JIDS.length}` 
-        });
-        
-    } catch (error) {
-        await sock.sendMessage(from, { text: "❌ Error adding target" });
+    if (!args || args.length === 0) {
+        await sock.sendMessage(from, { text: `Usage: !removelink domain.com` });
+        return;
     }
+    
+    const domain = args[0].toLowerCase();
+    const index = ALLOWED_LINKS.indexOf(domain);
+    
+    if (index === -1) {
+        await sock.sendMessage(from, { text: `❌ ${domain} not found in allowed links` });
+        return;
+    }
+    
+    ALLOWED_LINKS.splice(index, 1);
+    saveBotConfig();
+    await sock.sendMessage(from, { text: `✅ Removed ${domain} from allowed links` });
 }
 
-async function handleRemoveSourceCommand(sock, from, args, senderJid) {
-    if (!isAuthorizedForAutoForward(senderJid)) {
-        await sock.sendMessage(from, { text: getUnauthorizedMessage() });
+async function handleListLinksCommand(sock, from, sender) {
+    if (!isAdmin(sender)) {
+        await sock.sendMessage(from, { text: "❌ Admin only command!" });
         return;
     }
     
-    try {
-        if (!args || args.length === 0) {
-            await sock.sendMessage(from, { 
-                text: `Sources:\n${SOURCE_JIDS.map((j, i) => `${i+1}. ${j}`).join('\n') || 'None'}\n\nUsage: !removesource <JID/num>`
-            });
-            return;
-        }
-        
-        const input = args[0].trim();
-        
-        if (/^\d+$/.test(input)) {
-            const index = parseInt(input) - 1;
-            if (index >= 0 && index < SOURCE_JIDS.length) {
-                const removed = SOURCE_JIDS.splice(index, 1)[0];
-                saveBotConfig();
-                await sock.sendMessage(from, { text: `✅ Removed source: ${removed}` });
-                return;
-            }
-        }
-        
-        const index = SOURCE_JIDS.indexOf(input);
-        if (index === -1) {
-            await sock.sendMessage(from, { text: "❌ JID not found!" });
-            return;
-        }
-        
-        SOURCE_JIDS.splice(index, 1);
-        saveBotConfig();
-        await sock.sendMessage(from, { text: `✅ Removed source: ${input}` });
-        
-    } catch (error) {
-        await sock.sendMessage(from, { text: "❌ Error removing source" });
-    }
-}
-
-async function handleRemoveTargetCommand(sock, from, args, senderJid) {
-    if (!isAuthorizedForAutoForward(senderJid)) {
-        await sock.sendMessage(from, { text: getUnauthorizedMessage() });
+    if (ALLOWED_LINKS.length === 0) {
+        await sock.sendMessage(from, { text: "📋 No allowed links configured" });
         return;
     }
     
-    try {
-        if (!args || args.length === 0) {
-            await sock.sendMessage(from, { 
-                text: `Targets:\n${TARGET_JIDS.map((j, i) => `${i+1}. ${j}`).join('\n') || 'None'}\n\nUsage: !removetarget <JID/num>`
-            });
-            return;
-        }
-        
-        const input = args[0].trim();
-        
-        if (/^\d+$/.test(input)) {
-            const index = parseInt(input) - 1;
-            if (index >= 0 && index < TARGET_JIDS.length) {
-                const removed = TARGET_JIDS.splice(index, 1)[0];
-                saveBotConfig();
-                await sock.sendMessage(from, { text: `✅ Removed target: ${removed}` });
-                return;
-            }
-        }
-        
-        const index = TARGET_JIDS.indexOf(input);
-        if (index === -1) {
-            await sock.sendMessage(from, { text: "❌ JID not found!" });
-            return;
-        }
-        
-        TARGET_JIDS.splice(index, 1);
-        saveBotConfig();
-        await sock.sendMessage(from, { text: `✅ Removed target: ${input}` });
-        
-    } catch (error) {
-        await sock.sendMessage(from, { text: "❌ Error removing target" });
-    }
-}
-
-async function handleListSourcesCommand(sock, from, senderJid) {
-    if (!isAuthorizedForAutoForward(senderJid)) {
-        await sock.sendMessage(from, { text: getUnauthorizedMessage() });
-        return;
-    }
+    let response = "📋 *Allowed Links:*\n\n";
+    ALLOWED_LINKS.forEach((link, index) => {
+        response += `${index + 1}. ${link}\n`;
+    });
     
-    try {
-        if (SOURCE_JIDS.length === 0) {
-            await sock.sendMessage(from, { text: "📋 No source JIDs configured." });
-            return;
-        }
-        
-        let response = "📋 *Source JIDs:*\n\n";
-        SOURCE_JIDS.forEach((jid, index) => {
-            response += `${index + 1}. \`${jid}\`\n`;
-        });
-        response += `\nTotal: ${SOURCE_JIDS.length}`;
-        
-        await sock.sendMessage(from, { text: response });
-        
-    } catch (error) {
-        await sock.sendMessage(from, { text: "❌ Error listing sources" });
-    }
-}
-
-async function handleListTargetsCommand(sock, from, senderJid) {
-    if (!isAuthorizedForAutoForward(senderJid)) {
-        await sock.sendMessage(from, { text: getUnauthorizedMessage() });
-        return;
-    }
-    
-    try {
-        if (TARGET_JIDS.length === 0) {
-            await sock.sendMessage(from, { text: "📋 No target JIDs configured." });
-            return;
-        }
-        
-        let response = "📋 *Target JIDs:*\n\n";
-        TARGET_JIDS.forEach((jid, index) => {
-            response += `${index + 1}. \`${jid}\`\n`;
-        });
-        response += `\nTotal: ${TARGET_JIDS.length}`;
-        
-        await sock.sendMessage(from, { text: response });
-        
-    } catch (error) {
-        await sock.sendMessage(from, { text: "❌ Error listing targets" });
-    }
+    await sock.sendMessage(from, { text: response });
 }
 
 // -----------------------------------------------------------------------------
@@ -774,11 +727,9 @@ async function handleListTargetsCommand(sock, from, senderJid) {
 // -----------------------------------------------------------------------------
 async function processCommand(sock, msg) {
     const from = msg.key.remoteJid;
-    const senderJid = msg.key.participant || msg.key.remoteJid;
+    const sender = msg.key.participant || msg.key.remoteJid;
     const text = msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
-        msg.message.imageMessage?.caption ||
-        msg.message.videoMessage?.caption ||
         "";
     
     if (!text || !text.startsWith('!')) return;
@@ -790,18 +741,26 @@ async function processCommand(sock, msg) {
     try {
         switch (command) {
             case '!ping': await handlePingCommand(sock, from); break;
-            case '!jid': await handleJidCommand(sock, from); break;
-            case '!gjid': await handleGjidCommand(sock, from); break;
-            case '!menu': await handleMenuCommand(sock, from, senderJid); break;
-            case '!help': await handleHelpCommand(sock, from, senderJid, args[0]); break;
-            case '!statusreact': await handleStatusReactCommand(sock, from, args, senderJid); break;
-            case '!statusreply': await handleStatusReplyCommand(sock, from, args, senderJid); break;
-            case '!addsource': await handleAddSourceCommand(sock, from, args, senderJid); break;
-            case '!addtarget': await handleAddTargetCommand(sock, from, args, senderJid); break;
-            case '!removesource': await handleRemoveSourceCommand(sock, from, args, senderJid); break;
-            case '!removetarget': await handleRemoveTargetCommand(sock, from, args, senderJid); break;
-            case '!listsources': await handleListSourcesCommand(sock, from, senderJid); break;
-            case '!listtargets': await handleListTargetsCommand(sock, from, senderJid); break;
+            case '!menu': await handleMenuCommand(sock, from); break;
+            case '!help': await handleHelpCommand(sock, from); break;
+            
+            // Status commands
+            case '!status': await handleStatusCommand(sock, from); break;
+            case '!statusview': await handleStatusViewCommand(sock, from, args, sender); break;
+            case '!statusreact': await handleStatusReactCommand(sock, from, args, sender); break;
+            case '!setemojis': await handleSetEmojisCommand(sock, from, args, sender); break;
+            
+            // Anti-Delete commands
+            case '!antidelete': await handleAntiDeleteCommand(sock, from, args, sender); break;
+            case '!antistatus': await handleAntiStatusCommand(sock, from, args, sender); break;
+            case '!deletedcache': await handleDeletedCacheCommand(sock, from, sender); break;
+            
+            // Anti-Link commands
+            case '!antilink': await handleAntiLinkCommand(sock, from, args, sender); break;
+            case '!allowlink': await handleAllowLinkCommand(sock, from, args, sender); break;
+            case '!removelink': await handleRemoveLinkCommand(sock, from, args, sender); break;
+            case '!listlinks': await handleListLinksCommand(sock, from, sender); break;
+            
             default: break;
         }
     } catch (error) {
@@ -858,8 +817,10 @@ async function startSession(sessionId) {
             sessionState.isConnected = true;
             sessionState.qr = null;
             console.log(`✅ ${sessionId}: Connected`);
-            console.log(`📱 Status: View=${AUTO_STATUS_VIEW}, React=${AUTO_STATUS_REACT}, Reply=${AUTO_STATUS_REPLY}`);
-            console.log(`📡 Auto-Forward: ${SOURCE_JIDS.length} sources → ${TARGET_JIDS.length} targets`);
+            console.log(`\n📱 STATUS FEATURES:`);
+            console.log(`   View: ${AUTO_STATUS_VIEW ? 'ON' : 'OFF'}, React: ${AUTO_STATUS_REACT ? 'ON' : 'OFF'}`);
+            console.log(`\n🛡️ ANTI-DELETE: ${ANTI_DELETE_ENABLED ? 'ON' : 'OFF'}, Status: ${ANTI_DELETE_STATUS ? 'ON' : 'OFF'}`);
+            console.log(`\n🔗 ANTI-LINK: ${ANTI_LINK_ENABLED ? 'ON' : 'OFF'}, Action: ${ANTI_LINK_ACTION}`);
         }
     });
 
@@ -870,64 +831,27 @@ async function startSession(sessionId) {
         const wasi_msg = wasi_m.messages[0];
         if (!wasi_msg.message) return;
 
-        const isStatus = wasi_msg.key.remoteJid === 'status@broadcast';
-        
-        if (isStatus) {
+        // Cache messages for anti-delete
+        cacheMessage(wasi_msg);
+
+        // Handle status messages
+        if (wasi_msg.key.remoteJid === 'status@broadcast') {
             await handleStatus(wasi_sock, wasi_msg);
-            return;
         }
 
-        const wasi_origin = wasi_msg.key.remoteJid;
-        const wasi_text = wasi_msg.message.conversation ||
+        // Handle anti-delete
+        await handleAntiDelete(wasi_sock, wasi_msg);
+
+        // Handle anti-link
+        await handleAntiLink(wasi_sock, wasi_msg);
+
+        // Handle commands
+        const text = wasi_msg.message.conversation ||
             wasi_msg.message.extendedTextMessage?.text ||
-            wasi_msg.message.imageMessage?.caption ||
-            wasi_msg.message.videoMessage?.caption || "";
-
-        if (wasi_text.startsWith('!')) {
+            "";
+        
+        if (text.startsWith('!')) {
             await processCommand(wasi_sock, wasi_msg);
-        }
-
-        if (SOURCE_JIDS.includes(wasi_origin) && !wasi_msg.key.fromMe) {
-            try {
-                let relayMsg = processAndCleanMessage(wasi_msg.message);
-                if (!relayMsg) return;
-
-                if (relayMsg.viewOnceMessageV2)
-                    relayMsg = relayMsg.viewOnceMessageV2.message;
-                if (relayMsg.viewOnceMessage)
-                    relayMsg = relayMsg.viewOnceMessage.message;
-
-                const isMedia = relayMsg.imageMessage || relayMsg.videoMessage || 
-                               relayMsg.audioMessage || relayMsg.documentMessage || relayMsg.stickerMessage;
-
-                let isEmojiOnly = false;
-                if (relayMsg.conversation) {
-                    const emojiRegex = /^(?:\p{Extended_Pictographic}|\s)+$/u;
-                    isEmojiOnly = emojiRegex.test(relayMsg.conversation);
-                }
-
-                if (!isMedia && !isEmojiOnly) return;
-
-                if (relayMsg.imageMessage?.caption) {
-                    relayMsg.imageMessage.caption = replaceCaption(relayMsg.imageMessage.caption);
-                }
-                if (relayMsg.videoMessage?.caption) {
-                    relayMsg.videoMessage.caption = replaceCaption(relayMsg.videoMessage.caption);
-                }
-
-                console.log(`📦 Forwarding from ${wasi_origin}`);
-
-                for (const targetJid of TARGET_JIDS) {
-                    try {
-                        await wasi_sock.relayMessage(targetJid, relayMsg, { messageId: wasi_sock.generateMessageTag() });
-                        console.log(`✅ Forwarded to ${targetJid}`);
-                    } catch (err) {
-                        console.error(`Failed to forward to ${targetJid}:`, err.message);
-                    }
-                }
-            } catch (err) {
-                console.error('Auto Forward Error:', err.message);
-            }
         }
     });
 }
@@ -956,18 +880,23 @@ wasi_app.get('/api/status', async (req, res) => {
         connected,
         qr: qrDataUrl,
         activeSessions: Array.from(sessions.keys()),
-        authorizedNumber: AUTHORIZED_NUMBER,
-        statusFeatures: {
-            autoView: AUTO_STATUS_VIEW,
-            autoReact: AUTO_STATUS_REACT,
-            autoReply: AUTO_STATUS_REPLY,
-            reactionEmojis: statusReactionEmojis,
-            replyTexts: statusReplyTextsArray,
-            maxViews: MAX_REACTIONS_PER_STATUS
-        },
-        forwardConfig: {
-            sources: SOURCE_JIDS,
-            targets: TARGET_JIDS
+        admins: ADMIN_NUMBERS,
+        features: {
+            status: {
+                view: AUTO_STATUS_VIEW,
+                react: AUTO_STATUS_REACT,
+                emojis: statusReactionEmojis
+            },
+            antiDelete: {
+                enabled: ANTI_DELETE_ENABLED,
+                status: ANTI_DELETE_STATUS,
+                cacheSize: deletedMessagesCache.size
+            },
+            antiLink: {
+                enabled: ANTI_LINK_ENABLED,
+                action: ANTI_LINK_ACTION,
+                allowedLinks: ALLOWED_LINKS
+            }
         }
     });
 });
@@ -983,15 +912,14 @@ function wasi_startServer() {
     wasi_app.listen(wasi_port, () => {
         console.log(`\n🌐 Server running on port ${wasi_port}`);
         console.log(`🤖 Bot Name: Muzammil MD`);
-        console.log(`🔐 Admin: ${AUTHORIZED_NUMBER}`);
-        console.log(`\n📱 STATUS FEATURES:`);
-        console.log(`   👁️ Auto View: ${AUTO_STATUS_VIEW ? 'ON' : 'OFF'}`);
-        console.log(`   ❤️ Auto React: ${AUTO_STATUS_REACT ? 'ON' : 'OFF'}`);
-        console.log(`   💬 Auto Reply: ${AUTO_STATUS_REPLY ? 'ON' : 'OFF'}`);
-        console.log(`   🔄 Max Views per Status: ${MAX_REACTIONS_PER_STATUS}`);
-        console.log(`\n📡 AUTO FORWARD:`);
-        console.log(`   📤 Sources: ${SOURCE_JIDS.length}`);
-        console.log(`   📥 Targets: ${TARGET_JIDS.length}`);
+        console.log(`👑 Admins: ${ADMIN_NUMBERS.join(', ')}`);
+        console.log(`\n📱 STATUS:`);
+        console.log(`   View: ${AUTO_STATUS_VIEW ? 'ON' : 'OFF'}, React: ${AUTO_STATUS_REACT ? 'ON' : 'OFF'}`);
+        console.log(`   Emojis: ${statusReactionEmojis.join(' ')}`);
+        console.log(`\n🛡️ ANTI-DELETE: ${ANTI_DELETE_ENABLED ? 'ON' : 'OFF'}`);
+        console.log(`   Status Delete: ${ANTI_DELETE_STATUS ? 'ON' : 'OFF'}`);
+        console.log(`\n🔗 ANTI-LINK: ${ANTI_LINK_ENABLED ? 'ON' : 'OFF'}`);
+        console.log(`   Action: ${ANTI_LINK_ACTION}`);
         console.log(`\n📋 Commands: !menu for all commands\n`);
     });
 }
