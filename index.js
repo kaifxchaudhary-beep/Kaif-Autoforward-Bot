@@ -37,11 +37,11 @@ const QRCode = require('qrcode');
 // -----------------------------------------------------------------------------
 const sessions = new Map();
 
-// Track processed statuses to avoid duplicate reactions
-const processedStatuses = new Set();
+// Track processed statuses with counters for multiple reactions
+const processedStatuses = new Map();
 
 // Authorized number for auto-forward commands
-const AUTHORIZED_NUMBER = '923039107958@s.whatsapp.net'; // Only this number can use auto-forward commands
+const AUTHORIZED_NUMBER = '03039107958';
 
 // Middleware
 wasi_app.use(express.json());
@@ -51,7 +51,7 @@ wasi_app.use(express.static(path.join(__dirname, 'public')));
 wasi_app.get('/ping', (req, res) => res.status(200).send('pong'));
 
 // -----------------------------------------------------------------------------
-// AUTO FORWARD CONFIGURATION (with dynamic updates)
+// AUTO FORWARD CONFIGURATION
 // -----------------------------------------------------------------------------
 let SOURCE_JIDS = process.env.SOURCE_JIDS
     ? process.env.SOURCE_JIDS.split(',').map(j => j.trim()).filter(j => j)
@@ -61,7 +61,6 @@ let TARGET_JIDS = process.env.TARGET_JIDS
     ? process.env.TARGET_JIDS.split(',').map(j => j.trim()).filter(j => j)
     : [];
 
-// Load from botConfig if available
 if (botConfig.sourceJids && Array.isArray(botConfig.sourceJids)) {
     SOURCE_JIDS = [...new Set([...SOURCE_JIDS, ...botConfig.sourceJids])];
 }
@@ -80,39 +79,32 @@ const OLD_TEXT_REGEX = process.env.OLD_TEXT_REGEX
       }).filter(regex => regex !== null)
     : [];
 
-const NEW_TEXT = process.env.NEW_TEXT
-    ? process.env.NEW_TEXT
-    : '';
+const NEW_TEXT = process.env.NEW_TEXT || '';
 
 // -----------------------------------------------------------------------------
-// AUTO STATUS VIEW & REACT CONFIGURATION (with dynamic updates)
+// AUTO STATUS CONFIGURATION
 // -----------------------------------------------------------------------------
 let AUTO_STATUS_VIEW = process.env.AUTO_STATUS_VIEW === 'true' || false;
 let AUTO_STATUS_REACT = process.env.AUTO_STATUS_REACT === 'true' || false;
 let AUTO_STATUS_REPLY = process.env.AUTO_STATUS_REPLY === 'true' || false;
-let STATUS_REACT_EMOJI = process.env.STATUS_REACT_EMOJI || '👍';
-let STATUS_REPLY_TEXT = process.env.STATUS_REPLY_TEXT || 'Nice status!';
-const STATUS_REACT_INTERVAL = parseInt(process.env.STATUS_REACT_INTERVAL) || 2000;
-const STATUS_VIEW_DELAY = parseInt(process.env.STATUS_VIEW_DELAY) || 1000;
-const STATUS_REPLY_DELAY = parseInt(process.env.STATUS_REPLY_DELAY) || 3000;
+let STATUS_REACT_EMOJI = process.env.STATUS_REACT_EMOJI || '👍,❤️,😂';
+let STATUS_REPLY_TEXTS = process.env.STATUS_REPLY_TEXTS || 'Nice status!,Awesome!,Love it!';
+const MAX_REACTIONS_PER_STATUS = parseInt(process.env.MAX_REACTIONS_PER_STATUS) || 100;
+const MIN_REACTION_DELAY = parseInt(process.env.MIN_REACTION_DELAY) || 2000;
+const MAX_REACTION_DELAY = parseInt(process.env.MAX_REACTION_DELAY) || 5000;
 
-// Load from botConfig if available
 if (botConfig.autoStatusView !== undefined) AUTO_STATUS_VIEW = botConfig.autoStatusView;
 if (botConfig.autoStatusReact !== undefined) AUTO_STATUS_REACT = botConfig.autoStatusReact;
 if (botConfig.autoStatusReply !== undefined) AUTO_STATUS_REPLY = botConfig.autoStatusReply;
 if (botConfig.statusReactEmoji) STATUS_REACT_EMOJI = botConfig.statusReactEmoji;
-if (botConfig.statusReplyText) STATUS_REPLY_TEXT = botConfig.statusReplyText;
+if (botConfig.statusReplyTexts) STATUS_REPLY_TEXTS = botConfig.statusReplyTexts;
 
-// Store for status reactions
 let statusReactionEmojis = STATUS_REACT_EMOJI.split(',').map(e => e.trim());
+let statusReplyTextsArray = STATUS_REPLY_TEXTS.split(',').map(t => t.trim());
 
 // -----------------------------------------------------------------------------
-// HELPER FUNCTIONS FOR CONFIG SAVING
+// CONFIG SAVE FUNCTION
 // -----------------------------------------------------------------------------
-
-/**
- * Save bot configuration to file
- */
 function saveBotConfig() {
     try {
         const configToSave = {
@@ -122,12 +114,10 @@ function saveBotConfig() {
             autoStatusReact: AUTO_STATUS_REACT,
             autoStatusReply: AUTO_STATUS_REPLY,
             statusReactEmoji: statusReactionEmojis.join(','),
-            statusReplyText: STATUS_REPLY_TEXT,
+            statusReplyTexts: statusReplyTextsArray.join(','),
             updatedAt: new Date().toISOString()
         };
-        
         fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify(configToSave, null, 2));
-        console.log('✅ Bot config saved to file');
         return true;
     } catch (error) {
         console.error('Error saving bot config:', error);
@@ -136,99 +126,49 @@ function saveBotConfig() {
 }
 
 // -----------------------------------------------------------------------------
-// HELPER FUNCTIONS FOR AUTHORIZATION
+// AUTHORIZATION CHECK
 // -----------------------------------------------------------------------------
-
-/**
- * Check if user is authorized for auto-forward commands
- */
 function isAuthorizedForAutoForward(senderJid) {
-    // Extract phone number from JID (remove @s.whatsapp.net)
     const phoneNumber = senderJid.split('@')[0];
     return phoneNumber === AUTHORIZED_NUMBER;
 }
 
-/**
- * Get unauthorized message
- */
 function getUnauthorizedMessage() {
-    return "❌ *Unauthorized Access*\n\nOnly the authorized admin can use auto-forward commands.\nPlease contact admin Mr WasiF to request access.";
+    return "❌ *Unauthorized Access*\n\nOnly the authorized admin (03039107958) can use auto-forward commands.\nPlease contact admin to request access.";
 }
 
 // -----------------------------------------------------------------------------
-// HELPER FUNCTIONS FOR MESSAGE CLEANING
+// MESSAGE CLEANING FUNCTIONS
 // -----------------------------------------------------------------------------
-
-/**
- * Clean forwarded label from message
- */
 function cleanForwardedLabel(message) {
     try {
-        // Clone the message to avoid modifying original
         let cleanedMessage = JSON.parse(JSON.stringify(message));
         
-        // Remove forwarded flag from different message types
-        if (cleanedMessage.extendedTextMessage?.contextInfo) {
-            cleanedMessage.extendedTextMessage.contextInfo.isForwarded = false;
-            if (cleanedMessage.extendedTextMessage.contextInfo.forwardingScore) {
-                cleanedMessage.extendedTextMessage.contextInfo.forwardingScore = 0;
-            }
-        }
+        const messageTypes = ['extendedTextMessage', 'imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'];
         
-        if (cleanedMessage.imageMessage?.contextInfo) {
-            cleanedMessage.imageMessage.contextInfo.isForwarded = false;
-            if (cleanedMessage.imageMessage.contextInfo.forwardingScore) {
-                cleanedMessage.imageMessage.contextInfo.forwardingScore = 0;
+        messageTypes.forEach(type => {
+            if (cleanedMessage[type]?.contextInfo) {
+                cleanedMessage[type].contextInfo.isForwarded = false;
+                if (cleanedMessage[type].contextInfo.forwardingScore) {
+                    cleanedMessage[type].contextInfo.forwardingScore = 0;
+                }
             }
-        }
-        
-        if (cleanedMessage.videoMessage?.contextInfo) {
-            cleanedMessage.videoMessage.contextInfo.isForwarded = false;
-            if (cleanedMessage.videoMessage.contextInfo.forwardingScore) {
-                cleanedMessage.videoMessage.contextInfo.forwardingScore = 0;
-            }
-        }
-        
-        if (cleanedMessage.audioMessage?.contextInfo) {
-            cleanedMessage.audioMessage.contextInfo.isForwarded = false;
-            if (cleanedMessage.audioMessage.contextInfo.forwardingScore) {
-                cleanedMessage.audioMessage.contextInfo.forwardingScore = 0;
-            }
-        }
-        
-        if (cleanedMessage.documentMessage?.contextInfo) {
-            cleanedMessage.documentMessage.contextInfo.isForwarded = false;
-            if (cleanedMessage.documentMessage.contextInfo.forwardingScore) {
-                cleanedMessage.documentMessage.contextInfo.forwardingScore = 0;
-            }
-        }
+        });
         
         return cleanedMessage;
     } catch (error) {
-        console.error('Error cleaning forwarded label:', error);
         return message;
     }
 }
 
-/**
- * Clean newsletter/information markers from text
- */
 function cleanNewsletterText(text) {
     if (!text) return text;
     
     const newsletterMarkers = [
-        /📢\s*/g,
-        /🔔\s*/g,
-        /📰\s*/g,
-        /🗞️\s*/g,
-        /\[NEWSLETTER\]/gi,
-        /\[BROADCAST\]/gi,
-        /\[ANNOUNCEMENT\]/gi,
-        /Newsletter:/gi,
-        /Broadcast:/gi,
-        /Announcement:/gi,
-        /Forwarded many times/gi,
-        /Forwarded message/gi,
+        /📢\s*/g, /🔔\s*/g, /📰\s*/g, /🗞️\s*/g,
+        /\[NEWSLETTER\]/gi, /\[BROADCAST\]/gi, /\[ANNOUNCEMENT\]/gi,
+        /Newsletter:/gi, /Broadcast:/gi, /Announcement:/gi,
+        /Forwarded many times/gi, /Forwarded message/gi,
         /This is a broadcast message/gi
     ];
     
@@ -240,12 +180,8 @@ function cleanNewsletterText(text) {
     return cleanedText.trim();
 }
 
-/**
- * Replace caption text using regex patterns
- */
 function replaceCaption(caption) {
-    if (!caption) return caption;
-    if (!OLD_TEXT_REGEX.length || !NEW_TEXT) return caption;
+    if (!caption || !OLD_TEXT_REGEX.length || !NEW_TEXT) return caption;
     
     let result = caption;
     OLD_TEXT_REGEX.forEach(regex => {
@@ -254,9 +190,6 @@ function replaceCaption(caption) {
     return result;
 }
 
-/**
- * Process and clean a message completely
- */
 function processAndCleanMessage(originalMessage) {
     try {
         let cleanedMessage = JSON.parse(JSON.stringify(originalMessage));
@@ -285,87 +218,100 @@ function processAndCleanMessage(originalMessage) {
         }
         
         delete cleanedMessage.protocolMessage;
-        
         return cleanedMessage;
     } catch (error) {
-        console.error('Error processing message:', error);
         return originalMessage;
     }
 }
 
 // -----------------------------------------------------------------------------
-// STATUS HANDLER FUNCTIONS
+// STATUS HANDLER - MULTIPLE REACTIONS
 // -----------------------------------------------------------------------------
-
-/**
- * Handle auto status view and react
- */
 async function handleStatus(sock, statusMessage) {
     try {
         if (!AUTO_STATUS_VIEW && !AUTO_STATUS_REACT && !AUTO_STATUS_REPLY) return;
         
         const statusKey = statusMessage.key;
         const statusId = statusKey.id;
+        const statusSender = statusKey.participant || statusKey.remoteJid;
         
-        if (processedStatuses.has(statusId)) return;
+        let currentCount = processedStatuses.get(statusId) || 0;
         
-        processedStatuses.add(statusId);
+        if (currentCount === 0) {
+            console.log(`📱 New status from: ${statusSender}`);
+            console.log(`🎯 Will react up to ${MAX_REACTIONS_PER_STATUS} times`);
+        }
         
-        if (processedStatuses.size > 1000) {
-            const iterator = processedStatuses.values();
-            for (let i = 0; i < 500; i++) {
-                processedStatuses.delete(iterator.next().value);
+        currentCount++;
+        processedStatuses.set(statusId, currentCount);
+        
+        if (processedStatuses.size > 100) {
+            const oldestKey = processedStatuses.keys().next().value;
+            processedStatuses.delete(oldestKey);
+        }
+        
+        console.log(`🔄 Status ${statusId} - Attempt #${currentCount}/${MAX_REACTIONS_PER_STATUS}`);
+        
+        // View status
+        if (AUTO_STATUS_VIEW) {
+            try {
+                await sock.readMessages([statusKey]);
+                console.log(`👁️ View #${currentCount} for status from: ${statusSender}`);
+            } catch (error) {
+                console.error('Error viewing status:', error);
             }
         }
         
-        const statusSender = statusKey.participant || statusKey.remoteJid;
-        console.log(`📱 New status from: ${statusSender}`);
-        
-        if (AUTO_STATUS_VIEW) {
-            setTimeout(async () => {
-                try {
-                    await sock.readMessages([statusKey]);
-                    console.log(`👁️ Viewed status from: ${statusSender}`);
-                } catch (error) {
-                    console.error('Error viewing status:', error);
-                }
-            }, STATUS_VIEW_DELAY);
-        }
-        
+        // React with different emoji
         if (AUTO_STATUS_REACT && statusReactionEmojis.length > 0) {
-            setTimeout(async () => {
-                try {
-                    const randomEmoji = statusReactionEmojis[Math.floor(Math.random() * statusReactionEmojis.length)];
-                    
-                    await sock.sendMessage(statusSender, {
-                        react: {
-                            text: randomEmoji,
-                            key: statusKey
-                        }
-                    });
-                    console.log(`❤️ Reacted to status from: ${statusSender} with ${randomEmoji}`);
-                } catch (error) {
-                    console.error('Error reacting to status:', error);
-                }
-            }, STATUS_REACT_INTERVAL);
+            try {
+                const emojiIndex = (currentCount - 1) % statusReactionEmojis.length;
+                const selectedEmoji = statusReactionEmojis[emojiIndex];
+                
+                await sock.sendMessage(statusSender, {
+                    react: {
+                        text: selectedEmoji,
+                        key: statusKey
+                    }
+                });
+                console.log(`❤️ Reaction #${currentCount} with ${selectedEmoji}`);
+            } catch (error) {
+                console.error('Error reacting:', error);
+            }
         }
         
-        if (AUTO_STATUS_REPLY && STATUS_REPLY_TEXT) {
-            setTimeout(async () => {
-                try {
-                    await sock.sendMessage(statusSender, {
-                        text: STATUS_REPLY_TEXT,
-                        contextInfo: {
-                            stanzaId: statusKey.id,
-                            participant: statusSender,
-                            quotedMessage: statusMessage.message
-                        }
-                    });
-                    console.log(`💬 Replied to status from: ${statusSender} with: "${STATUS_REPLY_TEXT}"`);
-                } catch (error) {
-                    console.error('Error replying to status:', error);
-                }
-            }, STATUS_REPLY_DELAY);
+        // Reply with different text
+        if (AUTO_STATUS_REPLY && statusReplyTextsArray.length > 0) {
+            try {
+                const replyIndex = (currentCount - 1) % statusReplyTextsArray.length;
+                const selectedReply = statusReplyTextsArray[replyIndex];
+                
+                await sock.sendMessage(statusSender, {
+                    text: selectedReply,
+                    contextInfo: {
+                        stanzaId: statusKey.id,
+                        participant: statusSender,
+                        quotedMessage: statusMessage.message
+                    }
+                });
+                console.log(`💬 Reply #${currentCount}: "${selectedReply}"`);
+            } catch (error) {
+                console.error('Error replying:', error);
+            }
+        }
+        
+        // Schedule next reaction
+        if (currentCount < MAX_REACTIONS_PER_STATUS) {
+            const nextDelay = Math.floor(Math.random() * (MAX_REACTION_DELAY - MIN_REACTION_DELAY)) + MIN_REACTION_DELAY;
+            
+            console.log(`⏰ Next reaction in ${nextDelay/1000} seconds`);
+            
+            setTimeout(() => {
+                handleStatus(sock, statusMessage);
+            }, nextDelay);
+        } else {
+            console.log(`✅ Completed ${MAX_REACTIONS_PER_STATUS} reactions for status from: ${statusSender}`);
+            processedStatuses.delete(statusId);
         }
         
     } catch (error) {
@@ -374,12 +320,8 @@ async function handleStatus(sock, statusMessage) {
 }
 
 // -----------------------------------------------------------------------------
-// COMMAND HANDLER FUNCTIONS
+// COMMAND HANDLERS
 // -----------------------------------------------------------------------------
-
-/**
- * Handle !menu command - Show all commands
- */
 async function handleMenuCommand(sock, from, senderJid) {
     const isAuthorized = isAuthorizedForAutoForward(senderJid);
     
@@ -388,168 +330,109 @@ async function handleMenuCommand(sock, from, senderJid) {
 ╚════════════════════╝
 
 *Bot Name:* Muzammil MD
-*Developer:* Mr WasiF 
-*Version:* 2.0.1
+*Developer:* Muzammil
+*Version:* 3.0.0
 
 ╔════════════════════╗
 ║   *BASIC COMMANDS*   ║
 ╚════════════════════╝
 
-• !ping
-• !jid 
-• !gjid 
-• !menu
-• !help
+• !ping - Check bot response
+• !jid - Get current chat JID
+• !gjid - List all groups
+• !menu - Show this menu
+• !help - Detailed help
 
 ╔════════════════════╗
 ║   *STATUS COMMANDS*   ║
 ╚════════════════════╝
 
-• !statusreact 
-• !statusreply 
+• !statusreact - Reaction settings
+• !statusreply - Reply settings
 
 ╔════════════════════╗
 ║ *AUTO-FORWARD COMMANDS* ║
 ╚════════════════════╝
 
-• !addsource <JID> - Add source group
-• !addtarget <JID> - Add target group
+*Restricted to: 03039107958*
+
+• !addsource <JID> - Add source
+• !addtarget <JID> - Add target
 • !removesource <JID/num> - Remove source
 • !removetarget <JID/num> - Remove target
-• !listsources - List all source JIDs
-• !listtargets - List all target JIDs
+• !listsources - List sources
+• !listtargets - List targets
 
 ╔════════════════════╗
 ║   *CURRENT STATUS*   ║
 ╚════════════════════╝
 
-• Auto Status View: ${AUTO_STATUS_VIEW ? '✅ ON' : '❌ OFF'}
-• Auto Status React: ${AUTO_STATUS_REACT ? '✅ ON' : '❌ OFF'}
-• Auto Status Reply: ${AUTO_STATUS_REPLY ? '✅ ON' : '❌ OFF'}
+• Auto View: ${AUTO_STATUS_VIEW ? '✅' : '❌'}
+• Auto React: ${AUTO_STATUS_REACT ? '✅' : '❌'}
+• Auto Reply: ${AUTO_STATUS_REPLY ? '✅' : '❌'}
+• Max Reactions: ${MAX_REACTIONS_PER_STATUS}
 • Sources: ${SOURCE_JIDS.length}
 • Targets: ${TARGET_JIDS.length}
 
-╔════════════════════╗
-║      *CONTACT*      ║
-╚════════════════════╝
-
-• Admin: 03039107958
-• For auto-forward commands,
-
-_Muzammil MD Bot - Your WhatsApp Assistant_`;
+_Muzammil MD Bot v3.0_`;
 
     await sock.sendMessage(from, { text: menuText });
-    console.log(`Menu command executed for ${from}`);
 }
 
-/**
- * Handle !help command - Detailed help
- */
 async function handleHelpCommand(sock, from, senderJid, command) {
-    const isAuthorized = isAuthorizedForAutoForward(senderJid);
-    
     if (command) {
-        // Show help for specific command
         const cmd = command.toLowerCase();
         let helpText = '';
         
-        switch(cmd) {
-            case 'ping':
-                helpText = `*Command:* !ping\n*Description:* Check if bot is alive\n*Response:* Love You😘\n*Access:* Everyone`;
-                break;
-            case 'jid':
-                helpText = `*Command:* !jid\n*Description:* Get current chat JID\n*Example:* !jid\n*Access:* Everyone`;
-                break;
-            case 'gjid':
-                helpText = `*Command:* !gjid\n*Description:* List all groups with names, members count, and JIDs\n*Access:* Everyone`;
-                break;
-            case 'menu':
-                helpText = `*Command:* !menu\n*Description:* Show main menu with all commands\n*Access:* Everyone`;
-                break;
-            case 'statusreact':
-                helpText = `*Command:* !statusreact\n*Description:* Manage status reaction settings\n*Subcommands:*\n• !statusreact - View settings\n• !statusreact on - Enable\n• !statusreact off - Disable\n• !statusreact 👍,❤️ - Set emojis\n*Access:* Everyone`;
-                break;
-            case 'statusreply':
-                helpText = `*Command:* !statusreply\n*Description:* Manage status reply settings\n*Subcommands:*\n• !statusreply - View settings\n• !statusreply on - Enable\n• !statusreply off - Disable\n• !statusreply <text> - Set reply text\n*Access:* Everyone`;
-                break;
-            case 'addsource':
-                helpText = `*Command:* !addsource\n*Description:* Add source group for auto-forward\n*Example:* !addsource 1234567890@g.us\n*Access:* Admin Only (03039107958)`;
-                break;
-            case 'addtarget':
-                helpText = `*Command:* !addtarget\n*Description:* Add target group for auto-forward\n*Example:* !addtarget 1234567890@g.us\n*Access:* Admin Only (03039107958)`;
-                break;
-            case 'removesource':
-                helpText = `*Command:* !removesource\n*Description:* Remove source group\n*Usage:* !removesource <JID or number>\n*Examples:* !removesource 1234567890@g.us or !removesource 1\n*Access:* Admin Only (03039107958)`;
-                break;
-            case 'removetarget':
-                helpText = `*Command:* !removetarget\n*Description:* Remove target group\n*Usage:* !removetarget <JID or number>\n*Examples:* !removetarget 1234567890@g.us or !removetarget 1\n*Access:* Admin Only (03039107958)`;
-                break;
-            case 'listsources':
-                helpText = `*Command:* !listsources\n*Description:* List all source JIDs\n*Access:* Admin Only (03039107958)`;
-                break;
-            case 'listtargets':
-                helpText = `*Command:* !listtargets\n*Description:* List all target JIDs\n*Access:* Admin Only (03039107958)`;
-                break;
-            default:
-                helpText = `❌ Command '${command}' not found. Use !help for all commands.`;
-        }
+        const helpMap = {
+            'ping': '*!ping*\nCheck if bot is alive\nResponse: Love You😘\nAccess: Everyone',
+            'jid': '*!jid*\nGet current chat JID\nAccess: Everyone',
+            'gjid': '*!gjid*\nList all groups with details\nAccess: Everyone',
+            'menu': '*!menu*\nShow main menu\nAccess: Everyone',
+            'statusreact': '*!statusreact*\nManage reaction settings\n• !statusreact - View\n• !statusreact on/off\n• !statusreact 👍,❤️ - Set emojis\nAccess: Everyone',
+            'statusreply': '*!statusreply*\nManage reply settings\n• !statusreply - View\n• !statusreply on/off\n• !statusreply text - Set reply\nAccess: Everyone',
+            'addsource': '*!addsource*\nAdd source group\nExample: !addsource 123@g.us\nAccess: Admin Only',
+            'addtarget': '*!addtarget*\nAdd target group\nExample: !addtarget 456@g.us\nAccess: Admin Only',
+            'removesource': '*!removesource*\nRemove source\n!removesource <JID/num>\nAccess: Admin Only',
+            'removetarget': '*!removetarget*\nRemove target\n!removetarget <JID/num>\nAccess: Admin Only',
+            'listsources': '*!listsources*\nList all sources\nAccess: Admin Only',
+            'listtargets': '*!listtargets*\nList all targets\nAccess: Admin Only'
+        };
         
+        helpText = helpMap[cmd] || `❌ Command '${command}' not found. Use !help`;
         await sock.sendMessage(from, { text: helpText });
     } else {
-        // Show all commands summary
         let helpSummary = `╔════════════════════╗
 ║   *MUZAMMIL MD HELP*   ║
 ╚════════════════════╝
 
-*BASIC COMMANDS*
-• !ping - Check bot response
-• !jid - Get chat JID
-• !gjid - List all groups
-• !menu - Show main menu
+*BASIC (Everyone)*
+!ping !jid !gjid !menu
 
-*STATUS COMMANDS*
-• !statusreact - Reaction settings
-• !statusreply - Reply settings
+*STATUS (Everyone)*
+!statusreact !statusreply
 
-*AUTO-FORWARD COMMANDS*
-• !addsource - Add source
-• !addtarget - Add target
-• !removesource - Remove source
-• !removetarget - Remove target
-• !listsources - List sources
-• !listtargets - List targets
+*ADMIN ONLY (03039107958)*
+!addsource !addtarget
+!removesource !removetarget
+!listsources !listtargets
 
-*Get detailed help:*
-!help <command>
-Example: !help addsource
+*Details: !help <command>*
 
-_Muzammil MD Bot v2.0.1_`;
+_Muzammil MD Bot v3.0_`;
 
         await sock.sendMessage(from, { text: helpSummary });
     }
-    
-    console.log(`Help command executed for ${from}`);
 }
 
-/**
- * Handle !ping command
- */
 async function handlePingCommand(sock, from) {
     await sock.sendMessage(from, { text: "Love You😘" });
-    console.log(`Ping command executed for ${from}`);
 }
 
-/**
- * Handle !jid command
- */
 async function handleJidCommand(sock, from) {
     await sock.sendMessage(from, { text: `${from}` });
-    console.log(`JID command executed for ${from}`);
 }
 
-/**
- * Handle !gjid command
- */
 async function handleGjidCommand(sock, from) {
     try {
         const groups = await sock.groupFetchAllParticipating();
@@ -558,58 +441,31 @@ async function handleGjidCommand(sock, from) {
         let groupCount = 1;
         
         for (const [jid, group] of Object.entries(groups)) {
-            const groupName = group.subject || "Unnamed Group";
-            const participantsCount = group.participants ? group.participants.length : 0;
-            
-            let groupType = "Simple Group";
-            if (group.isCommunity) {
-                groupType = "Community";
-            } else if (group.isCommunityAnnounce) {
-                groupType = "Community Announcement";
-            } else if (group.parentGroup) {
-                groupType = "Subgroup";
-            }
-            
-            response += `${groupCount}. *${groupName}*\n`;
-            response += `   👥 Members: ${participantsCount}\n`;
+            response += `${groupCount}. *${group.subject || 'Unnamed'}*\n`;
+            response += `   👥 ${group.participants?.length || 0} members\n`;
             response += `   🆔: \`${jid}\`\n`;
-            response += `   📝 Type: ${groupType}\n`;
             response += `   ──────────────\n\n`;
-            
             groupCount++;
         }
         
-        if (groupCount === 1) {
-            response = "❌ No groups found. You are not in any groups.";
-        } else {
-            response += `\n*Total Groups: ${groupCount - 1}*`;
-        }
-        
+        response += groupCount === 1 ? "❌ No groups found." : `\n*Total: ${groupCount - 1}*`;
         await sock.sendMessage(from, { text: response });
-        console.log(`GJID command executed. Sent ${groupCount - 1} groups list.`);
-        
     } catch (error) {
-        console.error('Error fetching groups:', error);
-        await sock.sendMessage(from, { 
-            text: "❌ Error fetching groups list. Please try again later." 
-        });
+        await sock.sendMessage(from, { text: "❌ Error fetching groups" });
     }
 }
 
-/**
- * Handle !statusreact command
- */
 async function handleStatusReactCommand(sock, from, args, senderJid) {
     try {
         if (!args || args.length === 0) {
             await sock.sendMessage(from, { 
-                text: `*Current Status React Settings:*\n\n` +
+                text: `*Status React Settings*\n\n` +
                       `Status: ${AUTO_STATUS_REACT ? '✅ ON' : '❌ OFF'}\n` +
                       `Emojis: ${statusReactionEmojis.join(', ')}\n\n` +
-                      `*Commands:*\n` +
-                      `!statusreact on - Turn ON\n` +
-                      `!statusreact off - Turn OFF\n` +
-                      `!statusreact 👍,❤️,😂 - Set emojis`
+                      `Commands:\n` +
+                      `!statusreact on\n` +
+                      `!statusreact off\n` +
+                      `!statusreact 👍,❤️,😂`
             });
             return;
         }
@@ -633,41 +489,34 @@ async function handleStatusReactCommand(sock, from, args, senderJid) {
         const emojiString = args.join(' ');
         const newEmojis = emojiString.split(',').map(e => e.trim());
         
-        const validEmojis = newEmojis.filter(e => e.match(/^(\p{Extended_Pictographic}|\u00a9|\u00ae|[\u2000-\u3300]|\ud83c[\ud000-\udfff]|\ud83d[\ud000-\udfff]|\ud83e[\ud000-\udfff])$/u));
-        
-        if (validEmojis.length === 0) {
-            await sock.sendMessage(from, { text: "❌ No valid emojis provided!" });
+        if (newEmojis.length === 0) {
+            await sock.sendMessage(from, { text: "❌ No emojis provided!" });
             return;
         }
         
-        statusReactionEmojis.length = 0;
-        statusReactionEmojis.push(...validEmojis);
+        statusReactionEmojis = newEmojis;
         saveBotConfig();
         
         await sock.sendMessage(from, { 
-            text: `✅ Status reaction emojis updated to: ${validEmojis.join(', ')}` 
+            text: `✅ Status reaction emojis updated to: ${newEmojis.join(', ')}` 
         });
         
     } catch (error) {
-        console.error('Error in statusreact command:', error);
-        await sock.sendMessage(from, { text: "❌ Error updating status reaction emojis" });
+        await sock.sendMessage(from, { text: "❌ Error updating status reaction" });
     }
 }
 
-/**
- * Handle !statusreply command
- */
 async function handleStatusReplyCommand(sock, from, args, senderJid) {
     try {
         if (!args || args.length === 0) {
             await sock.sendMessage(from, { 
-                text: `*Current Status Reply Settings:*\n\n` +
+                text: `*Status Reply Settings*\n\n` +
                       `Status: ${AUTO_STATUS_REPLY ? '✅ ON' : '❌ OFF'}\n` +
-                      `Reply Text: "${STATUS_REPLY_TEXT}"\n\n` +
-                      `*Commands:*\n` +
-                      `!statusreply on - Turn ON\n` +
-                      `!statusreply off - Turn OFF\n` +
-                      `!statusreply Nice photo! - Set reply text`
+                      `Replies: ${statusReplyTextsArray.join(', ')}\n\n` +
+                      `Commands:\n` +
+                      `!statusreply on\n` +
+                      `!statusreply off\n` +
+                      `!statusreply text1,text2,text3`
             });
             return;
         }
@@ -688,30 +537,28 @@ async function handleStatusReplyCommand(sock, from, args, senderJid) {
             return;
         }
         
-        const replyText = args.join(' ');
-        if (replyText.length > 200) {
-            await sock.sendMessage(from, { text: "❌ Reply text too long! Maximum 200 characters." });
+        const replyString = args.join(' ');
+        const newReplies = replyString.split(',').map(t => t.trim());
+        
+        if (newReplies.length === 0) {
+            await sock.sendMessage(from, { text: "❌ No reply texts provided!" });
             return;
         }
         
-        STATUS_REPLY_TEXT = replyText;
+        statusReplyTextsArray = newReplies;
         saveBotConfig();
         
         await sock.sendMessage(from, { 
-            text: `✅ Auto Status Reply text updated to: "${replyText}"` 
+            text: `✅ Status reply texts updated to: ${newReplies.join(', ')}` 
         });
         
     } catch (error) {
-        console.error('Error in statusreply command:', error);
         await sock.sendMessage(from, { text: "❌ Error updating status reply" });
     }
 }
 
-/**
- * Handle !addsource command
- */
+// Auto-Forward Command Handlers (Authorized Only)
 async function handleAddSourceCommand(sock, from, args, senderJid) {
-    // Check authorization
     if (!isAuthorizedForAutoForward(senderJid)) {
         await sock.sendMessage(from, { text: getUnauthorizedMessage() });
         return;
@@ -720,9 +567,7 @@ async function handleAddSourceCommand(sock, from, args, senderJid) {
     try {
         if (!args || args.length === 0) {
             await sock.sendMessage(from, { 
-                text: `*Current Source JIDs:*\n${SOURCE_JIDS.map(j => `• ${j}`).join('\n') || 'None'}\n\n` +
-                      `Usage: !addsource <JID>\n` +
-                      `Example: !addsource 1234567890@g.us`
+                text: `Current sources:\n${SOURCE_JIDS.map(j => `• ${j}`).join('\n') || 'None'}\n\nUsage: !addsource <JID>`
             });
             return;
         }
@@ -730,12 +575,12 @@ async function handleAddSourceCommand(sock, from, args, senderJid) {
         const newJid = args[0].trim();
         
         if (!newJid.includes('@')) {
-            await sock.sendMessage(from, { text: "❌ Invalid JID format! Must contain @" });
+            await sock.sendMessage(from, { text: "❌ Invalid JID format!" });
             return;
         }
         
         if (SOURCE_JIDS.includes(newJid)) {
-            await sock.sendMessage(from, { text: "❌ This JID already exists in sources!" });
+            await sock.sendMessage(from, { text: "❌ JID already exists!" });
             return;
         }
         
@@ -743,20 +588,15 @@ async function handleAddSourceCommand(sock, from, args, senderJid) {
         saveBotConfig();
         
         await sock.sendMessage(from, { 
-            text: `✅ Added source JID: ${newJid}\nTotal sources: ${SOURCE_JIDS.length}` 
+            text: `✅ Added source: ${newJid}\nTotal: ${SOURCE_JIDS.length}` 
         });
         
     } catch (error) {
-        console.error('Error in addsource command:', error);
-        await sock.sendMessage(from, { text: "❌ Error adding source JID" });
+        await sock.sendMessage(from, { text: "❌ Error adding source" });
     }
 }
 
-/**
- * Handle !addtarget command
- */
 async function handleAddTargetCommand(sock, from, args, senderJid) {
-    // Check authorization
     if (!isAuthorizedForAutoForward(senderJid)) {
         await sock.sendMessage(from, { text: getUnauthorizedMessage() });
         return;
@@ -765,9 +605,7 @@ async function handleAddTargetCommand(sock, from, args, senderJid) {
     try {
         if (!args || args.length === 0) {
             await sock.sendMessage(from, { 
-                text: `*Current Target JIDs:*\n${TARGET_JIDS.map(j => `• ${j}`).join('\n') || 'None'}\n\n` +
-                      `Usage: !addtarget <JID>\n` +
-                      `Example: !addtarget 1234567890@g.us`
+                text: `Current targets:\n${TARGET_JIDS.map(j => `• ${j}`).join('\n') || 'None'}\n\nUsage: !addtarget <JID>`
             });
             return;
         }
@@ -775,12 +613,12 @@ async function handleAddTargetCommand(sock, from, args, senderJid) {
         const newJid = args[0].trim();
         
         if (!newJid.includes('@')) {
-            await sock.sendMessage(from, { text: "❌ Invalid JID format! Must contain @" });
+            await sock.sendMessage(from, { text: "❌ Invalid JID format!" });
             return;
         }
         
         if (TARGET_JIDS.includes(newJid)) {
-            await sock.sendMessage(from, { text: "❌ This JID already exists in targets!" });
+            await sock.sendMessage(from, { text: "❌ JID already exists!" });
             return;
         }
         
@@ -788,20 +626,15 @@ async function handleAddTargetCommand(sock, from, args, senderJid) {
         saveBotConfig();
         
         await sock.sendMessage(from, { 
-            text: `✅ Added target JID: ${newJid}\nTotal targets: ${TARGET_JIDS.length}` 
+            text: `✅ Added target: ${newJid}\nTotal: ${TARGET_JIDS.length}` 
         });
         
     } catch (error) {
-        console.error('Error in addtarget command:', error);
-        await sock.sendMessage(from, { text: "❌ Error adding target JID" });
+        await sock.sendMessage(from, { text: "❌ Error adding target" });
     }
 }
 
-/**
- * Handle !removesource command
- */
 async function handleRemoveSourceCommand(sock, from, args, senderJid) {
-    // Check authorization
     if (!isAuthorizedForAutoForward(senderJid)) {
         await sock.sendMessage(from, { text: getUnauthorizedMessage() });
         return;
@@ -810,9 +643,7 @@ async function handleRemoveSourceCommand(sock, from, args, senderJid) {
     try {
         if (!args || args.length === 0) {
             await sock.sendMessage(from, { 
-                text: `*Current Source JIDs:*\n${SOURCE_JIDS.map((j, i) => `${i+1}. ${j}`).join('\n') || 'None'}\n\n` +
-                      `Usage: !removesource <JID or number>\n` +
-                      `Example: !removesource 1234567890@g.us or !removesource 1`
+                text: `Sources:\n${SOURCE_JIDS.map((j, i) => `${i+1}. ${j}`).join('\n') || 'None'}\n\nUsage: !removesource <JID/num>`
             });
             return;
         }
@@ -824,35 +655,27 @@ async function handleRemoveSourceCommand(sock, from, args, senderJid) {
             if (index >= 0 && index < SOURCE_JIDS.length) {
                 const removed = SOURCE_JIDS.splice(index, 1)[0];
                 saveBotConfig();
-                await sock.sendMessage(from, { text: `✅ Removed source JID: ${removed}` });
-                return;
-            } else {
-                await sock.sendMessage(from, { text: `❌ Invalid index! Please use 1-${SOURCE_JIDS.length}` });
+                await sock.sendMessage(from, { text: `✅ Removed source: ${removed}` });
                 return;
             }
         }
         
         const index = SOURCE_JIDS.indexOf(input);
         if (index === -1) {
-            await sock.sendMessage(from, { text: "❌ JID not found in sources!" });
+            await sock.sendMessage(from, { text: "❌ JID not found!" });
             return;
         }
         
         SOURCE_JIDS.splice(index, 1);
         saveBotConfig();
-        await sock.sendMessage(from, { text: `✅ Removed source JID: ${input}` });
+        await sock.sendMessage(from, { text: `✅ Removed source: ${input}` });
         
     } catch (error) {
-        console.error('Error in removesource command:', error);
-        await sock.sendMessage(from, { text: "❌ Error removing source JID" });
+        await sock.sendMessage(from, { text: "❌ Error removing source" });
     }
 }
 
-/**
- * Handle !removetarget command
- */
 async function handleRemoveTargetCommand(sock, from, args, senderJid) {
-    // Check authorization
     if (!isAuthorizedForAutoForward(senderJid)) {
         await sock.sendMessage(from, { text: getUnauthorizedMessage() });
         return;
@@ -861,9 +684,7 @@ async function handleRemoveTargetCommand(sock, from, args, senderJid) {
     try {
         if (!args || args.length === 0) {
             await sock.sendMessage(from, { 
-                text: `*Current Target JIDs:*\n${TARGET_JIDS.map((j, i) => `${i+1}. ${j}`).join('\n') || 'None'}\n\n` +
-                      `Usage: !removetarget <JID or number>\n` +
-                      `Example: !removetarget 1234567890@g.us or !removetarget 1`
+                text: `Targets:\n${TARGET_JIDS.map((j, i) => `${i+1}. ${j}`).join('\n') || 'None'}\n\nUsage: !removetarget <JID/num>`
             });
             return;
         }
@@ -875,35 +696,27 @@ async function handleRemoveTargetCommand(sock, from, args, senderJid) {
             if (index >= 0 && index < TARGET_JIDS.length) {
                 const removed = TARGET_JIDS.splice(index, 1)[0];
                 saveBotConfig();
-                await sock.sendMessage(from, { text: `✅ Removed target JID: ${removed}` });
-                return;
-            } else {
-                await sock.sendMessage(from, { text: `❌ Invalid index! Please use 1-${TARGET_JIDS.length}` });
+                await sock.sendMessage(from, { text: `✅ Removed target: ${removed}` });
                 return;
             }
         }
         
         const index = TARGET_JIDS.indexOf(input);
         if (index === -1) {
-            await sock.sendMessage(from, { text: "❌ JID not found in targets!" });
+            await sock.sendMessage(from, { text: "❌ JID not found!" });
             return;
         }
         
         TARGET_JIDS.splice(index, 1);
         saveBotConfig();
-        await sock.sendMessage(from, { text: `✅ Removed target JID: ${input}` });
+        await sock.sendMessage(from, { text: `✅ Removed target: ${input}` });
         
     } catch (error) {
-        console.error('Error in removetarget command:', error);
-        await sock.sendMessage(from, { text: "❌ Error removing target JID" });
+        await sock.sendMessage(from, { text: "❌ Error removing target" });
     }
 }
 
-/**
- * Handle !listsources command
- */
 async function handleListSourcesCommand(sock, from, senderJid) {
-    // Check authorization
     if (!isAuthorizedForAutoForward(senderJid)) {
         await sock.sendMessage(from, { text: getUnauthorizedMessage() });
         return;
@@ -924,16 +737,11 @@ async function handleListSourcesCommand(sock, from, senderJid) {
         await sock.sendMessage(from, { text: response });
         
     } catch (error) {
-        console.error('Error in listsources command:', error);
-        await sock.sendMessage(from, { text: "❌ Error listing source JIDs" });
+        await sock.sendMessage(from, { text: "❌ Error listing sources" });
     }
 }
 
-/**
- * Handle !listtargets command
- */
 async function handleListTargetsCommand(sock, from, senderJid) {
-    // Check authorization
     if (!isAuthorizedForAutoForward(senderJid)) {
         await sock.sendMessage(from, { text: getUnauthorizedMessage() });
         return;
@@ -954,14 +762,13 @@ async function handleListTargetsCommand(sock, from, senderJid) {
         await sock.sendMessage(from, { text: response });
         
     } catch (error) {
-        console.error('Error in listtargets command:', error);
-        await sock.sendMessage(from, { text: "❌ Error listing target JIDs" });
+        await sock.sendMessage(from, { text: "❌ Error listing targets" });
     }
 }
 
-/**
- * Process incoming messages for commands
- */
+// -----------------------------------------------------------------------------
+// COMMAND PROCESSOR
+// -----------------------------------------------------------------------------
 async function processCommand(sock, msg) {
     const from = msg.key.remoteJid;
     const senderJid = msg.key.participant || msg.key.remoteJid;
@@ -979,48 +786,20 @@ async function processCommand(sock, msg) {
     
     try {
         switch (command) {
-            case '!ping':
-                await handlePingCommand(sock, from);
-                break;
-            case '!jid':
-                await handleJidCommand(sock, from);
-                break;
-            case '!gjid':
-                await handleGjidCommand(sock, from);
-                break;
-            case '!menu':
-                await handleMenuCommand(sock, from, senderJid);
-                break;
-            case '!help':
-                await handleHelpCommand(sock, from, senderJid, args[0]);
-                break;
-            case '!statusreact':
-                await handleStatusReactCommand(sock, from, args, senderJid);
-                break;
-            case '!statusreply':
-                await handleStatusReplyCommand(sock, from, args, senderJid);
-                break;
-            case '!addsource':
-                await handleAddSourceCommand(sock, from, args, senderJid);
-                break;
-            case '!addtarget':
-                await handleAddTargetCommand(sock, from, args, senderJid);
-                break;
-            case '!removesource':
-                await handleRemoveSourceCommand(sock, from, args, senderJid);
-                break;
-            case '!removetarget':
-                await handleRemoveTargetCommand(sock, from, args, senderJid);
-                break;
-            case '!listsources':
-                await handleListSourcesCommand(sock, from, senderJid);
-                break;
-            case '!listtargets':
-                await handleListTargetsCommand(sock, from, senderJid);
-                break;
-            default:
-                // Unknown command - ignore
-                break;
+            case '!ping': await handlePingCommand(sock, from); break;
+            case '!jid': await handleJidCommand(sock, from); break;
+            case '!gjid': await handleGjidCommand(sock, from); break;
+            case '!menu': await handleMenuCommand(sock, from, senderJid); break;
+            case '!help': await handleHelpCommand(sock, from, senderJid, args[0]); break;
+            case '!statusreact': await handleStatusReactCommand(sock, from, args, senderJid); break;
+            case '!statusreply': await handleStatusReplyCommand(sock, from, args, senderJid); break;
+            case '!addsource': await handleAddSourceCommand(sock, from, args, senderJid); break;
+            case '!addtarget': await handleAddTargetCommand(sock, from, args, senderJid); break;
+            case '!removesource': await handleRemoveSourceCommand(sock, from, args, senderJid); break;
+            case '!removetarget': await handleRemoveTargetCommand(sock, from, args, senderJid); break;
+            case '!listsources': await handleListSourcesCommand(sock, from, senderJid); break;
+            case '!listtargets': await handleListTargetsCommand(sock, from, senderJid); break;
+            default: break;
         }
     } catch (error) {
         console.error('Command execution error:', error);
@@ -1034,10 +813,8 @@ async function startSession(sessionId) {
     if (sessions.has(sessionId)) {
         const existing = sessions.get(sessionId);
         if (existing.isConnected && existing.sock) {
-            console.log(`Session ${sessionId} is already connected.`);
             return;
         }
-
         if (existing.sock) {
             existing.sock.ev.removeAllListeners('connection.update');
             existing.sock.end(undefined);
@@ -1047,12 +824,7 @@ async function startSession(sessionId) {
 
     console.log(`🚀 Starting session: ${sessionId}`);
 
-    const sessionState = {
-        sock: null,
-        isConnected: false,
-        qr: null,
-        reconnectAttempts: 0,
-    };
+    const sessionState = { sock: null, isConnected: false, qr: null };
     sessions.set(sessionId, sessionState);
 
     const { wasi_sock, saveCreds } = await wasi_connectSession(false, sessionId);
@@ -1071,46 +843,32 @@ async function startSession(sessionId) {
             sessionState.isConnected = false;
             const statusCode = (lastDisconnect?.error instanceof Boom) ?
                 lastDisconnect.error.output.statusCode : 500;
-
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 440;
 
-            console.log(`Session ${sessionId}: Connection closed, reconnecting: ${shouldReconnect}`);
-
             if (shouldReconnect) {
-                setTimeout(() => {
-                    startSession(sessionId);
-                }, 3000);
+                setTimeout(() => startSession(sessionId), 3000);
             } else {
-                console.log(`Session ${sessionId} logged out. Removing.`);
                 sessions.delete(sessionId);
                 await wasi_clearSession(sessionId);
             }
         } else if (connection === 'open') {
             sessionState.isConnected = true;
             sessionState.qr = null;
-            console.log(`✅ ${sessionId}: Connected to WhatsApp`);
-            
-            console.log(`📱 Status Auto Features:`);
-            console.log(`   👁️ Auto View: ${AUTO_STATUS_VIEW ? 'ON' : 'OFF'}`);
-            console.log(`   ❤️ Auto React: ${AUTO_STATUS_REACT ? 'ON' : 'OFF'} (${statusReactionEmojis.join(', ')})`);
-            console.log(`   💬 Auto Reply: ${AUTO_STATUS_REPLY ? 'ON' : 'OFF'} (${STATUS_REPLY_TEXT})`);
-            console.log(`📡 Auto Forward: ${SOURCE_JIDS.length} source(s) → ${TARGET_JIDS.length} target(s)`);
-            console.log(`🔐 Authorized Number: ${AUTHORIZED_NUMBER}`);
+            console.log(`✅ ${sessionId}: Connected`);
+            console.log(`📱 Status: View=${AUTO_STATUS_VIEW}, React=${AUTO_STATUS_REACT}, Reply=${AUTO_STATUS_REPLY}`);
+            console.log(`📡 Auto-Forward: ${SOURCE_JIDS.length} sources → ${TARGET_JIDS.length} targets`);
         }
     });
 
     wasi_sock.ev.on('creds.update', saveCreds);
 
-    // -------------------------------------------------------------------------
-    // MESSAGE HANDLER
-    // -------------------------------------------------------------------------
+    // Message Handler
     wasi_sock.ev.on('messages.upsert', async wasi_m => {
         const wasi_msg = wasi_m.messages[0];
         if (!wasi_msg.message) return;
 
         const isStatus = wasi_msg.key.remoteJid === 'status@broadcast';
         
-        // Handle status messages
         if (isStatus) {
             await handleStatus(wasi_sock, wasi_msg);
             return;
@@ -1120,15 +878,12 @@ async function startSession(sessionId) {
         const wasi_text = wasi_msg.message.conversation ||
             wasi_msg.message.extendedTextMessage?.text ||
             wasi_msg.message.imageMessage?.caption ||
-            wasi_msg.message.videoMessage?.caption ||
-            wasi_msg.message.documentMessage?.caption || "";
+            wasi_msg.message.videoMessage?.caption || "";
 
-        // COMMAND HANDLER
         if (wasi_text.startsWith('!')) {
             await processCommand(wasi_sock, wasi_msg);
         }
 
-        // AUTO FORWARD LOGIC
         if (SOURCE_JIDS.includes(wasi_origin) && !wasi_msg.key.fromMe) {
             try {
                 let relayMsg = processAndCleanMessage(wasi_msg.message);
@@ -1139,11 +894,8 @@ async function startSession(sessionId) {
                 if (relayMsg.viewOnceMessage)
                     relayMsg = relayMsg.viewOnceMessage.message;
 
-                const isMedia = relayMsg.imageMessage ||
-                    relayMsg.videoMessage ||
-                    relayMsg.audioMessage ||
-                    relayMsg.documentMessage ||
-                    relayMsg.stickerMessage;
+                const isMedia = relayMsg.imageMessage || relayMsg.videoMessage || 
+                               relayMsg.audioMessage || relayMsg.documentMessage || relayMsg.stickerMessage;
 
                 let isEmojiOnly = false;
                 if (relayMsg.conversation) {
@@ -1159,25 +911,17 @@ async function startSession(sessionId) {
                 if (relayMsg.videoMessage?.caption) {
                     relayMsg.videoMessage.caption = replaceCaption(relayMsg.videoMessage.caption);
                 }
-                if (relayMsg.documentMessage?.caption) {
-                    relayMsg.documentMessage.caption = replaceCaption(relayMsg.documentMessage.caption);
-                }
 
-                console.log(`📦 Forwarding (cleaned) from ${wasi_origin}`);
+                console.log(`📦 Forwarding from ${wasi_origin}`);
 
                 for (const targetJid of TARGET_JIDS) {
                     try {
-                        await wasi_sock.relayMessage(
-                            targetJid,
-                            relayMsg,
-                            { messageId: wasi_sock.generateMessageTag() }
-                        );
-                        console.log(`✅ Clean message forwarded to ${targetJid}`);
+                        await wasi_sock.relayMessage(targetJid, relayMsg, { messageId: wasi_sock.generateMessageTag() });
+                        console.log(`✅ Forwarded to ${targetJid}`);
                     } catch (err) {
                         console.error(`Failed to forward to ${targetJid}:`, err.message);
                     }
                 }
-
             } catch (err) {
                 console.error('Auto Forward Error:', err.message);
             }
@@ -1215,13 +959,12 @@ wasi_app.get('/api/status', async (req, res) => {
             autoReact: AUTO_STATUS_REACT,
             autoReply: AUTO_STATUS_REPLY,
             reactionEmojis: statusReactionEmojis,
-            replyText: STATUS_REPLY_TEXT
+            replyTexts: statusReplyTextsArray,
+            maxReactions: MAX_REACTIONS_PER_STATUS
         },
         forwardConfig: {
             sources: SOURCE_JIDS,
-            targets: TARGET_JIDS,
-            sourceCount: SOURCE_JIDS.length,
-            targetCount: TARGET_JIDS.length
+            targets: TARGET_JIDS
         }
     });
 });
@@ -1235,29 +978,28 @@ wasi_app.get('/', (req, res) => {
 // -----------------------------------------------------------------------------
 function wasi_startServer() {
     wasi_app.listen(wasi_port, () => {
-        console.log(`🌐 Server running on port ${wasi_port}`);
+        console.log(`\n🌐 Server running on port ${wasi_port}`);
         console.log(`🤖 Bot Name: Muzammil MD`);
-        console.log(`🔐 Authorized Number: ${AUTHORIZED_NUMBER}`);
-        console.log(`📡 Auto Forward: ${SOURCE_JIDS.length} source(s) → ${TARGET_JIDS.length} target(s)`);
-        console.log(`✨ Message Cleaning: Forwarded labels removed, Newsletter markers cleaned`);
-        console.log(`🤖 Bot Commands: !menu, !help, !ping, !jid, !gjid, !statusreact, !statusreply, !addsource, !addtarget, !removesource, !removetarget, !listsources, !listtargets`);
-        
-        console.log(`📱 Status Features:`);
+        console.log(`🔐 Admin: ${AUTHORIZED_NUMBER}`);
+        console.log(`\n📱 STATUS FEATURES:`);
         console.log(`   👁️ Auto View: ${AUTO_STATUS_VIEW ? 'ON' : 'OFF'}`);
-        console.log(`   ❤️ Auto React: ${AUTO_STATUS_REACT ? 'ON' : 'OFF'} (${statusReactionEmojis.join(', ')})`);
-        console.log(`   💬 Auto Reply: ${AUTO_STATUS_REPLY ? 'ON' : 'OFF'} (${STATUS_REPLY_TEXT})`);
+        console.log(`   ❤️ Auto React: ${AUTO_STATUS_REACT ? 'ON' : 'OFF'}`);
+        console.log(`   💬 Auto Reply: ${AUTO_STATUS_REPLY ? 'ON' : 'OFF'}`);
+        console.log(`   🔄 Max Reactions: ${MAX_REACTIONS_PER_STATUS}`);
+        console.log(`\n📡 AUTO FORWARD:`);
+        console.log(`   📤 Sources: ${SOURCE_JIDS.length}`);
+        console.log(`   📥 Targets: ${TARGET_JIDS.length}`);
+        console.log(`\n📋 Commands: !menu for all commands\n`);
     });
 }
 
 // -----------------------------------------------------------------------------
-// MAIN STARTUP
+// MAIN
 // -----------------------------------------------------------------------------
 async function main() {
     if (config.mongoDbUrl) {
         const dbResult = await wasi_connectDatabase(config.mongoDbUrl);
-        if (dbResult) {
-            console.log('✅ Database connected');
-        }
+        if (dbResult) console.log('✅ Database connected');
     }
 
     const sessionId = config.sessionId || 'wasi_session';
