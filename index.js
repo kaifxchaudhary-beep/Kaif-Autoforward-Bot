@@ -41,7 +41,7 @@ const sessions = new Map();
 const processedStatuses = new Set();
 
 // Authorized number for auto-forward commands
-const AUTHORIZED_NUMBER = '03039107958'; // Only this number can use auto-forward commands
+const AUTHORIZED_NUMBER = '923039107958@s.whatsapp.net'; // Only this number can use auto-forward commands
 
 // Middleware
 wasi_app.use(express.json());
@@ -152,7 +152,7 @@ function isAuthorizedForAutoForward(senderJid) {
  * Get unauthorized message
  */
 function getUnauthorizedMessage() {
-    return "❌ *Unauthorized Access*\n\nOnly the authorized admin can use auto-forward commands.\nPlease contact admin @03039107958 to request access.";
+    return "❌ *Unauthorized Access*\n\nOnly the authorized admin can use auto-forward commands.\nPlease contact admin Mr WasiF to request access.";
 }
 
 // -----------------------------------------------------------------------------
@@ -388,31 +388,29 @@ async function handleMenuCommand(sock, from, senderJid) {
 ╚════════════════════╝
 
 *Bot Name:* Muzammil MD
-*Developer:* Muzammil
-*Version:* 2.0.0
+*Developer:* Mr WasiF 
+*Version:* 2.0.1
 
 ╔════════════════════╗
 ║   *BASIC COMMANDS*   ║
 ╚════════════════════╝
 
-• !ping - Check bot response (Love You😘)
-• !jid - Get current chat JID
-• !gjid - List all groups with details
-• !menu - Show this menu
-• !help - Detailed help for all commands
+• !ping
+• !jid 
+• !gjid 
+• !menu
+• !help
 
 ╔════════════════════╗
 ║   *STATUS COMMANDS*   ║
 ╚════════════════════╝
 
-• !statusreact - View/change status reaction settings
-• !statusreply - View/change status reply settings
+• !statusreact 
+• !statusreply 
 
 ╔════════════════════╗
 ║ *AUTO-FORWARD COMMANDS* ║
 ╚════════════════════╝
-
-*Note: These commands are restricted to admin only (03039107958)*
 
 • !addsource <JID> - Add source group
 • !addtarget <JID> - Add target group
@@ -436,7 +434,7 @@ async function handleMenuCommand(sock, from, senderJid) {
 ╚════════════════════╝
 
 • Admin: 03039107958
-• For auto-forward commands, contact admin
+• For auto-forward commands,
 
 _Muzammil MD Bot - Your WhatsApp Assistant_`;
 
@@ -503,17 +501,17 @@ async function handleHelpCommand(sock, from, senderJid, command) {
 ║   *MUZAMMIL MD HELP*   ║
 ╚════════════════════╝
 
-*BASIC COMMANDS (Everyone)*
+*BASIC COMMANDS*
 • !ping - Check bot response
 • !jid - Get chat JID
 • !gjid - List all groups
 • !menu - Show main menu
 
-*STATUS COMMANDS (Everyone)*
+*STATUS COMMANDS*
 • !statusreact - Reaction settings
 • !statusreply - Reply settings
 
-*AUTO-FORWARD COMMANDS (Admin Only - 03039107958)*
+*AUTO-FORWARD COMMANDS*
 • !addsource - Add source
 • !addtarget - Add target
 • !removesource - Remove source
@@ -525,7 +523,7 @@ async function handleHelpCommand(sock, from, senderJid, command) {
 !help <command>
 Example: !help addsource
 
-_Muzammil MD Bot v2.0_`;
+_Muzammil MD Bot v2.0.1_`;
 
         await sock.sendMessage(from, { text: helpSummary });
     }
