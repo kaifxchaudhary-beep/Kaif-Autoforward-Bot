@@ -37,7 +37,7 @@ const QRCode = require('qrcode');
 // -----------------------------------------------------------------------------
 const sessions = new Map();
 
-// Track processed statuses with counters for multiple reactions
+// Track processed statuses with counters for multiple views
 const processedStatuses = new Map();
 
 // Authorized number for auto-forward commands
@@ -82,13 +82,13 @@ const OLD_TEXT_REGEX = process.env.OLD_TEXT_REGEX
 const NEW_TEXT = process.env.NEW_TEXT || '';
 
 // -----------------------------------------------------------------------------
-// AUTO STATUS CONFIGURATION
+// AUTO STATUS CONFIGURATION - 100 VIEWS WITH CHANGING REACTIONS
 // -----------------------------------------------------------------------------
 let AUTO_STATUS_VIEW = process.env.AUTO_STATUS_VIEW === 'true' || false;
 let AUTO_STATUS_REACT = process.env.AUTO_STATUS_REACT === 'true' || false;
 let AUTO_STATUS_REPLY = process.env.AUTO_STATUS_REPLY === 'true' || false;
-let STATUS_REACT_EMOJI = process.env.STATUS_REACT_EMOJI || '👍,❤️,😂';
-let STATUS_REPLY_TEXTS = process.env.STATUS_REPLY_TEXTS || 'Nice status!,Awesome!,Love it!';
+let STATUS_REACT_EMOJI = process.env.STATUS_REACT_EMOJI || '👍,❤️,😂,😍,👏,🔥,🎉,🥰,😎,💯';
+let STATUS_REPLY_TEXTS = process.env.STATUS_REPLY_TEXTS || 'Nice status!,Awesome!,Love it!,Great!,Beautiful!,Cool!,Amazing!';
 const MAX_REACTIONS_PER_STATUS = parseInt(process.env.MAX_REACTIONS_PER_STATUS) || 100;
 const MIN_REACTION_DELAY = parseInt(process.env.MIN_REACTION_DELAY) || 2000;
 const MAX_REACTION_DELAY = parseInt(process.env.MAX_REACTION_DELAY) || 5000;
@@ -225,7 +225,7 @@ function processAndCleanMessage(originalMessage) {
 }
 
 // -----------------------------------------------------------------------------
-// STATUS HANDLER - MULTIPLE REACTIONS
+// STATUS HANDLER - 100 VIEWS WITH CHANGING REACTIONS
 // -----------------------------------------------------------------------------
 async function handleStatus(sock, statusMessage) {
     try {
@@ -239,12 +239,13 @@ async function handleStatus(sock, statusMessage) {
         
         if (currentCount === 0) {
             console.log(`📱 New status from: ${statusSender}`);
-            console.log(`🎯 Will react up to ${MAX_REACTIONS_PER_STATUS} times`);
+            console.log(`🎯 Will generate ${MAX_REACTIONS_PER_STATUS} views with changing reactions`);
         }
         
         currentCount++;
         processedStatuses.set(statusId, currentCount);
         
+        // Limit map size
         if (processedStatuses.size > 100) {
             const oldestKey = processedStatuses.keys().next().value;
             processedStatuses.delete(oldestKey);
@@ -252,17 +253,17 @@ async function handleStatus(sock, statusMessage) {
         
         console.log(`🔄 Status ${statusId} - Attempt #${currentCount}/${MAX_REACTIONS_PER_STATUS}`);
         
-        // View status
+        // ✅ View status - یہ ویو بڑھائے گا (ہر بار)
         if (AUTO_STATUS_VIEW) {
             try {
                 await sock.readMessages([statusKey]);
-                console.log(`👁️ View #${currentCount} for status from: ${statusSender}`);
+                console.log(`👁️ View #${currentCount} for status from: ${statusSender} (Total views: ${currentCount})`);
             } catch (error) {
                 console.error('Error viewing status:', error);
             }
         }
         
-        // React with different emoji
+        // ✅ React with different emoji - ہر بار نیا ری ایکشن (پرانا ہٹ جائے گا)
         if (AUTO_STATUS_REACT && statusReactionEmojis.length > 0) {
             try {
                 const emojiIndex = (currentCount - 1) % statusReactionEmojis.length;
@@ -274,13 +275,13 @@ async function handleStatus(sock, statusMessage) {
                         key: statusKey
                     }
                 });
-                console.log(`❤️ Reaction #${currentCount} with ${selectedEmoji}`);
+                console.log(`❤️ Reaction #${currentCount}: ${selectedEmoji}`);
             } catch (error) {
                 console.error('Error reacting:', error);
             }
         }
         
-        // Reply with different text
+        // ✅ Reply with different text - ہر بار نیا ریپلائی
         if (AUTO_STATUS_REPLY && statusReplyTextsArray.length > 0) {
             try {
                 const replyIndex = (currentCount - 1) % statusReplyTextsArray.length;
@@ -300,17 +301,19 @@ async function handleStatus(sock, statusMessage) {
             }
         }
         
-        // Schedule next reaction
+        // ✅ Schedule next view/reaction
         if (currentCount < MAX_REACTIONS_PER_STATUS) {
+            // Random delay between MIN and MAX
             const nextDelay = Math.floor(Math.random() * (MAX_REACTION_DELAY - MIN_REACTION_DELAY)) + MIN_REACTION_DELAY;
             
-            console.log(`⏰ Next reaction in ${nextDelay/1000} seconds`);
+            console.log(`⏰ Next view/reaction in ${nextDelay/1000} seconds (View #${currentCount + 1})`);
             
             setTimeout(() => {
                 handleStatus(sock, statusMessage);
             }, nextDelay);
         } else {
-            console.log(`✅ Completed ${MAX_REACTIONS_PER_STATUS} reactions for status from: ${statusSender}`);
+            console.log(`✅ Completed ${MAX_REACTIONS_PER_STATUS} views for status from: ${statusSender}`);
+            console.log(`📊 Total views generated: ${MAX_REACTIONS_PER_STATUS}`);
             processedStatuses.delete(statusId);
         }
         
@@ -331,7 +334,7 @@ async function handleMenuCommand(sock, from, senderJid) {
 
 *Bot Name:* Muzammil MD
 *Developer:* Muzammil
-*Version:* 3.0.0
+*Version:* 4.0.0
 
 ╔════════════════════╗
 ║   *BASIC COMMANDS*   ║
@@ -370,11 +373,11 @@ async function handleMenuCommand(sock, from, senderJid) {
 • Auto View: ${AUTO_STATUS_VIEW ? '✅' : '❌'}
 • Auto React: ${AUTO_STATUS_REACT ? '✅' : '❌'}
 • Auto Reply: ${AUTO_STATUS_REPLY ? '✅' : '❌'}
-• Max Reactions: ${MAX_REACTIONS_PER_STATUS}
+• Max Views: ${MAX_REACTIONS_PER_STATUS}
 • Sources: ${SOURCE_JIDS.length}
 • Targets: ${TARGET_JIDS.length}
 
-_Muzammil MD Bot v3.0_`;
+_Muzammil MD Bot v4.0_`;
 
     await sock.sendMessage(from, { text: menuText });
 }
@@ -390,7 +393,7 @@ async function handleHelpCommand(sock, from, senderJid, command) {
             'gjid': '*!gjid*\nList all groups with details\nAccess: Everyone',
             'menu': '*!menu*\nShow main menu\nAccess: Everyone',
             'statusreact': '*!statusreact*\nManage reaction settings\n• !statusreact - View\n• !statusreact on/off\n• !statusreact 👍,❤️ - Set emojis\nAccess: Everyone',
-            'statusreply': '*!statusreply*\nManage reply settings\n• !statusreply - View\n• !statusreply on/off\n• !statusreply text - Set reply\nAccess: Everyone',
+            'statusreply': '*!statusreply*\nManage reply settings\n• !statusreply - View\n• !statusreply on/off\n• !statusreply text1,text2 - Set replies\nAccess: Everyone',
             'addsource': '*!addsource*\nAdd source group\nExample: !addsource 123@g.us\nAccess: Admin Only',
             'addtarget': '*!addtarget*\nAdd target group\nExample: !addtarget 456@g.us\nAccess: Admin Only',
             'removesource': '*!removesource*\nRemove source\n!removesource <JID/num>\nAccess: Admin Only',
@@ -419,7 +422,7 @@ async function handleHelpCommand(sock, from, senderJid, command) {
 
 *Details: !help <command>*
 
-_Muzammil MD Bot v3.0_`;
+_Muzammil MD Bot v4.0_`;
 
         await sock.sendMessage(from, { text: helpSummary });
     }
@@ -960,7 +963,7 @@ wasi_app.get('/api/status', async (req, res) => {
             autoReply: AUTO_STATUS_REPLY,
             reactionEmojis: statusReactionEmojis,
             replyTexts: statusReplyTextsArray,
-            maxReactions: MAX_REACTIONS_PER_STATUS
+            maxViews: MAX_REACTIONS_PER_STATUS
         },
         forwardConfig: {
             sources: SOURCE_JIDS,
@@ -985,7 +988,7 @@ function wasi_startServer() {
         console.log(`   👁️ Auto View: ${AUTO_STATUS_VIEW ? 'ON' : 'OFF'}`);
         console.log(`   ❤️ Auto React: ${AUTO_STATUS_REACT ? 'ON' : 'OFF'}`);
         console.log(`   💬 Auto Reply: ${AUTO_STATUS_REPLY ? 'ON' : 'OFF'}`);
-        console.log(`   🔄 Max Reactions: ${MAX_REACTIONS_PER_STATUS}`);
+        console.log(`   🔄 Max Views per Status: ${MAX_REACTIONS_PER_STATUS}`);
         console.log(`\n📡 AUTO FORWARD:`);
         console.log(`   📤 Sources: ${SOURCE_JIDS.length}`);
         console.log(`   📥 Targets: ${TARGET_JIDS.length}`);
