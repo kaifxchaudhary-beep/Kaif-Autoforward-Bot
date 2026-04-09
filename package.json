@@ -1,7 +1,7 @@
 {
-  "name": "wasi-md-v7",
-  "version": "7.0.0",
-  "description": "WASI-MD WhatsApp Bot - A powerful modular WhatsApp bot",
+  "name": "Kaif-Autoforward-Bot",
+  "version": "2.0.0",
+  "description": "Automated WhatsApp Bot - A powerful modular WhatsApp bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
