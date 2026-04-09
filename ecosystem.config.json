@@ -1,7 +1,7 @@
 {
     "apps": [
         {
-            "name": "wasi-md-v7",
+            "name": "Kaif-Autoforward-Bot",
             "script": "index.js",
             "watch": false,
             "env": {
